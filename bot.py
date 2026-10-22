@@ -916,7 +916,7 @@ def upload(files, caption, thread_id, chat=None):
         if UPLOAD_AS_USER and (CHANNEL_ID or chat == user_uploader().me_id):
             # 私訊模式下，用你的帳號貼到你跟機器人的聊天（只有登入的那個帳號能這樣傳）
             sent = user_uploader().send(ok, caption=caption, thread_id=thread_id, progress=upload_meter(),
-                                        to=None if CHANNEL_ID else BOT_USERNAME)
+                                        to=CHANNEL_ID or BOT_USERNAME)
         else:
             sent = send_files(ok, caption=caption, thread_id=thread_id, chat=chat)
         if sent != len(ok):
@@ -968,8 +968,16 @@ def user_uploader():
     with _uploader_lock:  # 上傳和下載壓縮檔的執行緒可能同時要用
         if _uploader is None:
             from user_upload import Uploader
-            _uploader = Uploader(CHANNEL_ID or None)
+            _uploader = Uploader()
     return _uploader
+
+
+def close_uploader():
+    global _uploader
+    with _uploader_lock:
+        if _uploader is not None:
+            _uploader.close()
+            _uploader = None
 
 
 def trash(p: Path):
@@ -1407,7 +1415,6 @@ def watch_folder():
     已經問過或正在上傳的檔案不會再問。"""
     UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
     (UPLOAD_DIR / FAILED_DIR).mkdir(exist_ok=True)
-    notify_chat = next(iter(ALLOWED_USER_IDS), None)
     seen, queued = {}, set()
     log.info("上傳資料夾：%s", UPLOAD_DIR)
     while True:
@@ -1422,6 +1429,7 @@ def watch_folder():
                     ready.append(p)
                 seen[p] = stamp
             ready.sort()
+            notify_chat = next(iter(ALLOWED_USER_IDS), None)  # 可能在聊天裡才剛設好
             for i in range(0, len(ready), 10):  # 一次最多 10 個一組
                 chunk = ready[i:i + 10]
                 if notify_chat is None:
@@ -1604,6 +1612,177 @@ class Handler(BaseHTTPRequestHandler):
         log.info("http %s", fmt % args)
 
 
+# ---------------- 在聊天裡設定 ----------------
+
+_env_lock = threading.Lock()
+setup_state = {}  # 私訊裡正在設定的人：chat id → {"step": ..., "login": Login}
+
+
+def apply_env():
+    """照 os.environ 重新算一次會在聊天裡改的設定（不用重開）。"""
+    global CHANNEL_ID, TOPICS, UPLOAD_AS_USER, MAX_UPLOAD_MB, MAX_BYTES
+    CHANNEL_ID = os.environ.get("CHANNEL_ID", "").strip()
+    TOPICS = _parse_topics(os.environ.get("TOPICS", "")) if CHANNEL_ID else {}
+    ALLOWED_USER_IDS.clear()
+    ALLOWED_USER_IDS.update(int(x) for x in os.environ.get("ALLOWED_USER_IDS", "").split(",") if x.strip())
+    UPLOAD_AS_USER = os.environ.get("UPLOAD_AS_USER", "0") == "1"
+    MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "2000" if UPLOAD_AS_USER else "50"))
+    MAX_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+
+
+def save_env(**kv):
+    """把設定寫進 .env（有就改、沒有就加在最後），馬上生效。"""
+    with _env_lock:
+        lines = _env.read_text(encoding="utf-8").splitlines() if _env.exists() else []
+        for k, v in kv.items():
+            os.environ[k] = v
+            hit = [i for i, line in enumerate(lines) if line.split("=", 1)[0].strip() == k]
+            if hit:
+                lines[hit[0]] = f"{k}={v}"
+                lines = [line for i, line in enumerate(lines) if i not in hit[1:]]
+            else:
+                lines.append(f"{k}={v}")
+        _env.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        apply_env()
+
+
+def setup_text():
+    where = "這個聊天（私訊）" if not CHANNEL_ID else f"群組 {CHANNEL_ID}"
+    subs = "、".join(TOPICS) if TOPICS else "（沒有）"
+    big = f"開（用你的帳號傳，上限 {MAX_UPLOAD_MB}MB）" if UPLOAD_AS_USER else f"關（機器人傳，上限 {MAX_UPLOAD_MB}MB）"
+    return (f"⚙️ 目前設定\n下載結果傳到：{where}\n子頻道：{subs}\n大檔案：{big}\n\n要改哪一項？")
+
+
+def setup_keyboard():
+    return json.dumps({"inline_keyboard": [
+        [{"text": "📥 傳回這裡", "callback_data": "s|here"}, {"text": "👥 貼到群組", "callback_data": "s|group"}],
+        [{"text": "📦 大檔案（登入帳號）", "callback_data": "s|login"}]]})
+
+
+def show_setup(chat):
+    tg("sendMessage", {"chat_id": chat, "text": setup_text(), "reply_markup": setup_keyboard()})
+
+
+def on_setup_button(choice, chat, msg_id):
+    if choice == "here":
+        save_env(CHANNEL_ID="", TOPICS="")
+        return edit(chat, msg_id, "✅ 之後下載結果都會傳回這個聊天。")
+    if choice == "group":
+        return edit(chat, msg_id, "👥 貼到群組：\n1. 把我加進群組，設成管理員。\n"
+                                  "2. 在群組裡打 /setup，之後就會貼到那裡。\n"
+                                  "3. 群組有開「話題」的話，到每個想用的子頻道裡各打一次 /setup，"
+                                  "子頻道就會加進按鈕。名稱想自己取就打 /setup 名稱。\n"
+                                  "想改回私訊，打 /setup 按「傳回這裡」。")
+    if choice == "login":
+        if os.environ.get("TELEGRAM_API_ID") and os.environ.get("TELEGRAM_API_HASH"):
+            setup_state[chat] = {"step": "phone"}
+            return edit(chat, msg_id, LOGIN_PHONE)
+        setup_state[chat] = {"step": "api_id"}
+        return edit(chat, msg_id, "📦 用你的帳號傳大檔案（最大 2GB）。\n"
+                                  "1. 到 https://my.telegram.org 登入 → API development tools，隨便填個名稱建立。\n"
+                                  "2. 把 api_id（一串數字）傳給我。\n隨時打 /cancel 取消。")
+
+
+LOGIN_PHONE = "把你的手機號碼傳給我，要加國碼，例如 +886912345678。"
+
+
+def setup_input(chat, text, msg):
+    """設定進行中：收你傳來的 api_id、api_hash、手機號碼、驗證碼、兩步驟驗證密碼。"""
+    st = setup_state[chat]
+    step = st["step"]
+    if step == "api_id":
+        if not re.fullmatch(r"\d+", text):
+            return notify(chat, "api_id 應該是一串數字，再傳一次。")
+        st["api_id"], st["step"] = text, "api_hash"
+        return notify(chat, "收到。再把 api_hash（32 個英數字）傳給我。")
+    if step == "api_hash":
+        if not re.fullmatch(r"[0-9a-f]{32}", text):
+            return notify(chat, "api_hash 應該是 32 個 0-9、a-f 的字，再傳一次。")
+        save_env(TELEGRAM_API_ID=st["api_id"], TELEGRAM_API_HASH=text)
+        delete_message(chat, msg)
+        st["step"] = "phone"
+        return notify(chat, "收到。" + LOGIN_PHONE)
+    if step == "phone":
+        phone = re.sub(r"[^\d+]", "", text)
+        if not phone.startswith("+"):
+            return notify(chat, "號碼前面要加國碼，例如 +886912345678。")
+        close_uploader()  # 重新登入時，舊的連線會鎖住 user.session
+        from user_upload import Login
+        try:
+            st["login"] = Login(os.environ["TELEGRAM_API_ID"], os.environ["TELEGRAM_API_HASH"])
+            st["login"].phone(phone)
+        except Exception as e:
+            setup_state.pop(chat, None)
+            return notify(chat, f"❌ 寄驗證碼失敗：{e}\n打 /setup 重來。")
+        st["step"] = "code"
+        delete_message(chat, msg)
+        return notify(chat, "Telegram 寄了驗證碼給你（在「Telegram」官方對話裡）。\n"
+                            "⚠️ 驗證碼原樣轉傳會被 Telegram 作廢，請在數字中間加空格再傳，例如 1 2 3 4 5。")
+    if step == "code":
+        code = re.sub(r"\D", "", text)
+        delete_message(chat, msg)
+        try:
+            me = st["login"].code(code)
+        except Exception as e:
+            return notify(chat, f"❌ 驗證碼不對或過期了：{e}\n再傳一次，或打 /cancel 取消。")
+        if me is None:
+            st["step"] = "password"
+            return notify(chat, "你的帳號有開兩步驟驗證，請傳密碼給我（收到後會馬上刪掉那則訊息）。")
+        return login_done(chat, me)
+    if step == "password":
+        delete_message(chat, msg)
+        try:
+            me = st["login"].password(text)
+        except Exception as e:
+            return notify(chat, f"❌ 密碼不對：{e}\n再傳一次，或打 /cancel 取消。")
+        return login_done(chat, me)
+
+
+def login_done(chat, me):
+    setup_state.pop(chat, None)
+    save_env(UPLOAD_AS_USER="1")
+    notify(chat, f"✅ 已登入 {me.first_name}，之後大檔案用你的帳號傳（上限 {MAX_UPLOAD_MB}MB）。")
+
+
+def cancel_setup(chat):
+    st = setup_state.pop(chat, None)
+    if st and st.get("login"):
+        st["login"].close()
+    notify(chat, "已取消設定。" if st else "現在沒有在設定。")
+
+
+def delete_message(chat, msg):
+    """刪掉含有驗證碼、密碼的訊息。"""
+    try:
+        tg("deleteMessage", {"chat_id": chat, "message_id": msg["message_id"]})
+    except Exception:
+        pass
+
+
+def setup_group(msg, arg):
+    """在群組（或它的子頻道）打 /setup：之後貼到這個群組，子頻道加進按鈕。"""
+    chat = msg["chat"]
+    gid = str(chat["id"])
+    tid = msg.get("message_thread_id") if msg.get("is_topic_message") else 0
+    topics = dict(TOPICS) if CHANNEL_ID == gid else {}
+    reply = {"chat_id": chat["id"]}
+    if tid:
+        reply["message_thread_id"] = tid
+    text = "✅ 之後下載結果會貼到這個群組。"
+    if chat.get("is_forum"):
+        created = (msg.get("reply_to_message") or {}).get("forum_topic_created") or {}
+        name = re.sub(r"[,:]", "", arg or created.get("name") or ("General" if not tid else "")).strip()
+        if not name:
+            reply["text"] = "找不到這個子頻道的名稱，請打 /setup 名稱（例如 /setup 影片）。"
+            return tg("sendMessage", reply)
+        topics = {n: i for n, i in topics.items() if i != tid}
+        topics[name] = tid
+        text += f"\n子頻道「{name}」加好了。目前：{'、'.join(topics)}"
+    save_env(CHANNEL_ID=gid, TOPICS=",".join(f"{n}:{i}" for n, i in topics.items()))
+    reply["text"] = text
+    tg("sendMessage", reply)
+
+
 # ---------------- 入口：Telegram 私訊機器人 ----------------
 
 def topic_keyboard(key):
@@ -1626,6 +1805,8 @@ def on_callback(cb):
         pass
     if data.startswith("r|"):
         return on_restart_button(data[2:], chat, msg.get("message_id"))
+    if data.startswith("s|"):
+        return on_setup_button(data[2:], chat, msg.get("message_id"))
     if data.startswith("p|"):  # 不解這個要密碼的壓縮檔了
         if data[2:] not in waiting:
             return edit(chat, msg.get("message_id"), "這個壓縮檔已經不在等密碼了。")
@@ -1645,10 +1826,23 @@ def on_message(msg):
     uid = (msg.get("from") or {}).get("id")
     chat = msg.get("chat", {})
     text = (msg.get("text") or "") + " " + (msg.get("caption") or "")
+    private = chat.get("type") == "private"
+    if not ALLOWED_USER_IDS and private and text.startswith("/start"):
+        # 還沒有主人：第一個私訊 /start 的人就是主人
+        save_env(ALLOWED_USER_IDS=str(uid))
+        log.info("主人設成 %s", uid)
+        notify(chat["id"], "👋 你現在是這個機器人的主人了，只有你能用。\n"
+                           "傳連結給我就會下載後傳回這裡。想改成貼到群組，或開大檔案，按下面的按鈕；"
+                           "之後打 /setup 也能再改。")
+        return show_setup(chat["id"])
     if uid not in ALLOWED_USER_IDS:
-        if text.startswith("/start") and chat.get("type") == "private":
-            notify(chat["id"], f"你的 user id 是 {uid}，請把它加到 ALLOWED_USER_IDS。")
+        if text.startswith("/start") and private:
+            notify(chat["id"], f"你的 user id 是 {uid}。請機器人的主人把它加到 .env 的 ALLOWED_USER_IDS。")
         return
+    words = text.split()
+    cmd = words[0].split("@")[0].lower() if words else ""
+    if cmd == "/setup" and not private:
+        return setup_group(msg, " ".join(words[1:]))
 
     # 在群組的某個子頻道裡打 /topicid，回報它的 id 方便填 TOPICS
     if text.strip().startswith("/topicid"):
@@ -1663,9 +1857,15 @@ def on_message(msg):
         except Exception as e:
             log.warning("回報 topic id 失敗：%s", e)
         return
-    if chat.get("type") != "private":
+    if not private:
         return
-    cmd = text.split()[0].split("@")[0].lower() if text.split() else ""
+    if cmd == "/setup":
+        setup_state.pop(chat["id"], None)
+        return show_setup(chat["id"])
+    if cmd == "/cancel":
+        return cancel_setup(chat["id"])
+    if chat["id"] in setup_state and not cmd.startswith("/"):
+        return setup_input(chat["id"], text.strip(), msg)
     if cmd == "/status":
         return live_status(chat["id"])
     if cmd == "/restart":
@@ -1691,7 +1891,7 @@ def on_message(msg):
                 + ("貼到頻道。" if CHANNEL_ID else "傳回這裡。"))
         if TOPICS:
             hint += "\n連結前後加上子頻道名稱（" + "、".join(TOPICS) + "）就會直接貼到那裡。"
-        hint += "\n/status 看進度和電腦狀態，/restart 重新啟動。"
+        hint += "\n/status 看進度和電腦狀態，/setup 改設定，/restart 重新啟動。"
         return notify(chat["id"], hint)
 
     tid = find_topic(text)
@@ -1763,6 +1963,7 @@ def main():
     try:  # 私訊機器人時，輸入框旁的選單會列出這些指令
         tg("setMyCommands", {"commands": json.dumps([
             {"command": "status", "description": "看進度和電腦狀態（CPU、RAM、GPU）"},
+            {"command": "setup", "description": "設定：傳到哪裡、群組子頻道、大檔案"},
             {"command": "restart", "description": "重新啟動機器人"}])})
     except Exception as e:
         log.warning("設定指令選單失敗：%s", e)

@@ -16,29 +16,38 @@
 - Windows 10 / 11
 - [Python 3.10 以上](https://www.python.org/downloads/)（安裝時勾選 **Add python.exe to PATH**）
 - 一個 Telegram 機器人 token：私訊 [@BotFather](https://t.me/BotFather) → `/newbot`，照指示取名，它會給你一串 `123456789:ABC...`
-- （建議）Telegram API 的 `api_id` 和 `api_hash`：到 <https://my.telegram.org> → **API development tools** 申請。有了它機器人才能用你的帳號傳大檔案（最大 2GB）；沒有的話只能傳 50MB 以下
 
 ffmpeg、7-Zip 和 Python 套件會在第一次設定時自動安裝（透過 winget 和 pip）。
 
 ## 安裝與設定
-1. 下載這個 repo：按右上角 **Code → Download ZIP** 解壓，或 `git clone https://github.com/leohsiehtw/tg-downloader.git`。
-2. 雙擊 `configure.bat`，照問題回答：
-   - **機器人 token**：貼上 BotFather 給的那串。
-   - **群組 / 頻道 id**：想要結果直接傳回私訊，**直接按 Enter 跳過**。要貼到群組的話見下方「貼到群組」。
-   - **api_id、api_hash**：貼上 my.telegram.org 拿到的值。
-   - 接著會請你登入自己的 Telegram 帳號（手機號碼加國碼，例如 `+886912345678`，再輸入驗證碼）。登入後會自動把你的 user id 填進允許名單。
-3. 雙擊 `restart.bat`，機器人就會在背景執行，右下角出現藍色圖示。
-4. 在 Telegram 打開你的機器人，傳 `/start`，再丟一個連結試試看。
+電腦上只要貼一次 token，其他設定都在 Telegram 跟機器人的聊天裡完成。
 
-設定都存在資料夾裡的 `.env`。想手動改，可以參考 [.env.example](.env.example)；改完執行 `restart.bat` 才會生效。
+1. 下載這個 repo：按右上角 **Code → Download ZIP** 解壓，或 `git clone https://github.com/leohsiehtw/tg-downloader.git`。
+2. 雙擊 `configure.bat`，貼上 BotFather 給的 token。
+3. 雙擊 `restart.bat`，機器人就會在背景執行，右下角出現藍色圖示。
+4. 在 Telegram 打開你的機器人，傳 `/start`。**第一個傳 `/start` 的人就是主人**，之後只有主人能用。
+5. 完成。丟一個連結給它試試看，下載結果會直接傳回這個聊天。
+
+想改設定時，私訊機器人 `/setup`，會跳出目前設定和三個按鈕：
+- **📥 傳回這裡**：下載結果傳回跟機器人的私訊（預設）。
+- **👥 貼到群組**：照「貼到群組」的說明設定。
+- **📦 大檔案（登入帳號）**：機器人自己只能傳 50MB 以下的檔案。登入你的 Telegram 帳號後，改用你的帳號傳，最大 2GB。機器人會一步步問你：
+  1. `api_id` 和 `api_hash`：到 <https://my.telegram.org> 登入 → **API development tools**，隨便填個名稱建立就會拿到。
+  2. 手機號碼（加國碼，例如 `+886912345678`）。
+  3. 驗證碼：Telegram 會寄到「Telegram」官方對話。**數字中間要加空格再傳**（例如 `1 2 3 4 5`），原樣轉傳會被 Telegram 作廢。
+  4. 有開兩步驟驗證的話，再傳密碼。
+
+  含有 api_hash、驗證碼、密碼的訊息，機器人收到後會馬上刪掉。隨時打 `/cancel` 取消。
+
+設定都存在資料夾裡的 `.env`，聊天裡改的會馬上生效。想手動改也可以，參考 [.env.example](.env.example)，改完執行 `restart.bat`。
 
 ### .env 設定一覽
 | 設定 | 說明 |
 |---|---|
-| `BOT_TOKEN` | 機器人 token（必填） |
-| `ALLOWED_USER_IDS` | 誰可以用這個機器人，逗號分隔的 user id。不在名單裡的人私訊 `/start`，機器人會回他的 id |
-| `CHANNEL_ID` | 要貼到的群組或頻道 id（`-100` 開頭）或 `@頻道名稱`。**留空＝結果傳回跟機器人的私訊** |
-| `TOPICS` | 群組子頻道，格式 `名稱:id,名稱:id`，例如 `影片:12,圖片:34,General:0`。只有設了 `CHANNEL_ID` 才有用 |
+| `BOT_TOKEN` | 機器人 token（`configure.bat` 填） |
+| `ALLOWED_USER_IDS` | 誰可以用這個機器人，逗號分隔的 user id。第一個 `/start` 的人會自動填進來。想多加人，請對方私訊機器人 `/start` 拿到 id，再加到這裡 |
+| `CHANNEL_ID` | 要貼到的群組 id（`-100` 開頭）。**留空＝結果傳回跟機器人的私訊** |
+| `TOPICS` | 群組子頻道，格式 `名稱:id,名稱:id`。在子頻道裡打 `/setup` 會自動加 |
 | `DEFAULT_TOPIC` | 不想每次選子頻道時，填一個 `TOPICS` 裡的名稱，一律貼到那裡 |
 | `TELEGRAM_API_ID`、`TELEGRAM_API_HASH` | my.telegram.org 拿到的值，用你的帳號傳大檔案時需要 |
 | `UPLOAD_AS_USER` | `1`＝用你的帳號上傳（上限 2GB）；`0`＝用機器人上傳（上限 50MB） |
@@ -55,23 +64,27 @@ ffmpeg、7-Zip 和 Python 套件會在第一次設定時自動安裝（透過 wi
 
 影片一律抓最高解析度。如果最高畫質是 iPhone 不能直接播的格式（VP9、AV1），會自動轉成同解析度的 H.264。圖片抓原圖，但 Telegram 顯示照片時會自己壓縮。
 
-> 私訊模式加上 `UPLOAD_AS_USER=1` 時，大檔案會用你的帳號傳進你跟機器人的聊天，所以看起來是「你」傳的。允許名單裡的其他人則由機器人回傳（上限 50MB）。
+> 私訊模式加上大檔案登入時，大檔案會用你的帳號傳進你跟機器人的聊天，所以看起來是「你」傳的。允許名單裡的其他人則由機器人回傳（上限 50MB）。
 
 ## 貼到群組（選用）
 1. 建立一個群組（想分類的話在群組設定開「話題 Topics」），把機器人加進去並設成**管理員**。
-2. 取得群組 id：重新執行 `configure.bat`，在群組 id 那題貼上 `-100` 開頭的 id（在 [Telegram Web](https://web.telegram.org/a/) 打開群組，網址 `#` 後面那串就是）。
-3. 子頻道：到每個子頻道裡打 `/topicid`，機器人會回 `名稱:id`，把它們加到 `.env` 的 `TOPICS=` 後面（逗號分隔），再執行 `restart.bat`。
+2. 在群組裡打 `/setup`，之後下載結果就會貼到這個群組。
+3. 有開話題的話，到每個想用的子頻道裡各打一次 `/setup`，它就會變成選擇按鈕。想自己取名就打 `/setup 名稱`（例如 `/setup 影片`）。
+4. 要改回私訊，私訊機器人 `/setup` → **傳回這裡**。
+
+用你的帳號傳大檔案時，你的帳號也要在這個群組裡。
 
 ## 壓縮檔（zip、7z、rar）
 把壓縮檔轉傳給機器人（分卷的話所有分卷一起轉傳），它會下載、解壓，把裡面的**圖片當圖片、影片當影片**傳出去，其他檔案不管。
 - 要密碼時，機器人會先自己試：檔名或說明裡的 `@帳號`、「密碼：xxx」，以及以前解開過的密碼。都不對就私訊問你，你直接把密碼傳給它就會接著解；有好幾個在等時，長按那則「需要密碼」→ 回覆再傳。不想解了按「不解了，刪掉」。一天沒回會自動刪掉。
 - 解開過的密碼存在 `.passwords.json`，下次先試。
-- 超過 20MB 的壓縮檔要用你的帳號下載，所以 `.env` 要有 `UPLOAD_AS_USER=1`。
+- 超過 20MB 的壓縮檔要用你的帳號下載，所以要先在 `/setup` 登入帳號（大檔案）。
 - 等密碼的壓縮檔在機器人重啟後就不見了，要重新轉傳。
 
 ## 從手機操作
 私訊機器人（或點輸入框旁的選單）：
 - `/status`：一則每 3 秒更新、持續 5 分鐘的訊息，顯示電腦的 CPU、RAM、GPU、每顆硬碟的剩餘空間、網速、現在在做什麼、還有幾個在排隊，以及累計處理了多少容量（存在 `.totals.json`）。
+- `/setup`：看和改設定（傳到哪、群組、大檔案）。
 - `/restart`：重新啟動機器人，順便更新下載工具（yt-dlp、gallery-dl）。如果還有工作在跑，會問你要「做完再重啟」還是「現在重啟」。
 
 ## 上傳資料夾
@@ -88,7 +101,7 @@ ffmpeg、7-Zip 和 Python 套件會在第一次設定時自動安裝（透過 wi
 ## 資料夾裡的檔案
 | 檔案 | 用途 |
 |---|---|
-| `configure.bat` | 第一次設定，或要換 token、重新登入時 |
+| `configure.bat` | 第一次設定，或要換 token 時 |
 | `restart.bat` | 改完設定後讓背景的機器人重開（不在電腦前就私訊 `/restart`） |
 | `stop.bat` | 停止機器人 |
 | `start.bat` | 在視窗裡前景執行、看即時紀錄（先跑 `stop.bat`） |
@@ -102,5 +115,5 @@ ffmpeg、7-Zip 和 Python 套件會在第一次設定時自動安裝（透過 wi
 - **X / IG 抓不到**：這類網站常要登入。在瀏覽器登入該網站，用擴充功能「Get cookies.txt LOCALLY」匯出 cookies，存進程式資料夾裡的 `cookies` 資料夾（每個網站一個檔，檔名隨意），機器人會依網址自己挑，不用重啟。cookies 會過期，抓不到時重新匯出一次。建議用小帳號。
 - **大檔案**：用你自己的帳號上傳，最大 2GB。超過 2000MB 的影片會自動壓縮畫質再上傳（有 NVIDIA 顯卡就用顯卡壓）。舊的 GTX 10 系列顯卡驅動不支援新版 ffmpeg，可以另外放一份 ffmpeg 8.0 的 `ffmpeg.exe` 到 `ffmpeg-gpu` 資料夾。
 - **某個網站突然壞了**：執行 `restart.bat` 或私訊 `/restart`，會順便更新下載工具，通常就修好了。
-- **機器人沒反應**：看 `bot.log` 最後幾行。出現「token 不對」就重新執行 `configure.bat`。確認你的 user id 在 `ALLOWED_USER_IDS` 裡。
-- **想從私訊模式改成貼到群組**：照「貼到群組」設好 `CHANNEL_ID`，執行 `restart.bat`。要改回私訊模式，把 `.env` 裡的 `CHANNEL_ID=` 那行清空再重啟。
+- **機器人沒反應**：看 `bot.log` 最後幾行。出現「token 不對」就重新執行 `configure.bat`。機器人回你「請主人把 id 加到 ALLOWED_USER_IDS」，表示你不是主人。
+- **主人設錯人了**：把 `.env` 裡的 `ALLOWED_USER_IDS=` 那行清空，執行 `restart.bat`，再用正確的帳號傳 `/start`。

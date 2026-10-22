@@ -1,8 +1,8 @@
 """
-一鍵設定：問你 token / api_id / api_hash，整理好 .env，登入你的 Telegram 帳號，
-自動填上你的 user id。雙擊 configure.bat 執行，之後要改設定也可以再跑一次。
+一鍵設定：只問機器人 token，存進 .env。其他設定（誰能用、傳到哪、群組子頻道、大檔案登入）
+都在 Telegram 跟機器人的聊天裡完成：私訊它 /start 或 /setup。
+雙擊 configure.bat 執行，之後要換 token 也可以再跑一次。
 """
-import asyncio
 import re
 from pathlib import Path
 
@@ -10,147 +10,61 @@ import requests
 
 HERE = Path(__file__).resolve().parent
 ENV = HERE / ".env"
-ORDER = ["BOT_TOKEN", "CHANNEL_ID", "ALLOWED_USER_IDS", "TOPICS", "DEFAULT_TOPIC",
-         "TELEGRAM_API_ID", "TELEGRAM_API_HASH", "UPLOAD_AS_USER",
-         "SHARED_SECRET", "PORT", "ENABLE_POLLING", "COOKIES_FILE"]
-VALID = {
-    "BOT_TOKEN": r"\d+:[\w-]{30,}",
-    "CHANNEL_ID": r"-?\d+|@\w+",
-    "ALLOWED_USER_IDS": r"\d+(,\d+)*",
-    "TELEGRAM_API_ID": r"\d+",
-    "TELEGRAM_API_HASH": r"[0-9a-f]{32}",
-}
+TOKEN_RE = r"\d+:[\w-]{30,}"
 
 
-def looks_ok(key, value):
-    if not value or "（" in value or "(" in value:
-        return False
-    pat = VALID.get(key)
-    return bool(re.fullmatch(pat, value)) if pat else True
+def read_lines():
+    return ENV.read_text(encoding="utf-8-sig").splitlines() if ENV.exists() else []
 
 
-def read_env():
-    """讀舊的 .env；同名多行時取第一個看起來正確的值，範本說明文字一律丟掉。"""
-    vals = {}
-    if ENV.exists():
-        for line in ENV.read_text(encoding="utf-8-sig").splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = (x.strip() for x in line.split("=", 1))
-                if k not in vals and looks_ok(k, v):
-                    vals[k] = v
-    return vals
+def current_token(lines):
+    for line in lines:
+        k, _, v = line.partition("=")
+        if k.strip() == "BOT_TOKEN" and re.fullmatch(TOKEN_RE, v.strip()):
+            return v.strip()
+    return ""
 
 
-def write_env(vals):
-    lines = ["# 由 configure.bat 產生。不要把這個檔案傳給任何人。"]
-    for k in ORDER + sorted(set(vals) - set(ORDER)):
-        if k in vals:
-            lines.append(f"{k}={vals[k]}")
+def save_token(lines, token):
+    """只改 BOT_TOKEN 那行，其他在聊天裡設好的值都留著。"""
+    lines = [line for line in lines if line.partition("=")[0].strip() != "BOT_TOKEN"]
+    if not lines:
+        lines = ["# 由 configure.bat 產生，其他設定在 Telegram 私訊機器人 /setup。不要把這個檔案傳給任何人。"]
+    lines.insert(1, f"BOT_TOKEN={token}")
     ENV.write_text("\n".join(lines) + "\n", encoding="utf-8")
-
-
-def mask(v):
-    return v[:4] + "…" + v[-3:] if len(v) > 10 else v
-
-
-def ask(vals, key, prompt, check=None, optional=False):
-    cur = vals.get(key, "")
-    while True:
-        hint = f"（直接按 Enter 沿用 {mask(cur)}）" if cur else ("（不用就直接按 Enter）" if optional else "")
-        v = input(f"{prompt}{hint}：").strip() or cur
-        if optional and not v:
-            vals.pop(key, None)
-            return ""
-        if not looks_ok(key, v):
-            print("  格式不對，請再貼一次。")
-            continue
-        if check:
-            err = check(v)
-            if err:
-                print(f"  {err}")
-                cur = "" if v == cur else cur
-                continue
-        vals[key] = v
-        return v
 
 
 def check_token(token):
     try:
         r = requests.get(f"https://api.telegram.org/bot{token}/getMe", timeout=20).json()
     except Exception as e:
-        return f"連不到 Telegram：{e}"
+        return None, f"連不到 Telegram：{e}"
     if not r.get("ok"):
-        return "Telegram 說這組 token 無效（Unauthorized）。請到 @BotFather 確認是最新的那組。"
-    print(f"  ✓ 機器人 @{r['result']['username']}")
-    return None
-
-
-def check_chat(token, chat_id):
-    try:
-        r = requests.get(f"https://api.telegram.org/bot{token}/getChat",
-                         params={"chat_id": chat_id}, timeout=20).json()
-    except Exception as e:
-        return f"連不到 Telegram：{e}"
-    if not r.get("ok"):
-        return "機器人看不到這個群組，請先把機器人加進群組並設成管理員。"
-    print(f"  ✓ 群組「{r['result'].get('title')}」")
-    return None
-
-
-async def login_user(vals):
-    from telethon import TelegramClient
-    client = TelegramClient(str(HERE / "user"), int(vals["TELEGRAM_API_ID"]), vals["TELEGRAM_API_HASH"])
-    print("\n接下來登入你的 Telegram 帳號（傳大檔案用）。手機號碼請加國碼，例如 +886912345678。")
-    await client.start()
-    me = await client.get_me()
-    print(f"  ✓ 已登入：{me.first_name}（id {me.id}）")
-    try:
-        chat = vals.get("CHANNEL_ID")
-        if chat:
-            await client.get_dialogs()
-            await client.get_entity(int(chat) if chat.lstrip("-").isdigit() else chat)
-            print("  ✓ 你的帳號找得到這個群組")
-    except Exception:
-        print("  ⚠ 你的帳號找不到這個群組，請確認你在群組裡。")
-    await client.disconnect()
-    return me.id
+        return None, "Telegram 說這組 token 無效（Unauthorized）。請到 @BotFather 確認是最新的那組。"
+    return r["result"]["username"], None
 
 
 def main():
     print("=== TG 下載機器人設定 ===\n")
-    vals = read_env()
-    vals.setdefault("PORT", "8080")
-    vals.setdefault("ENABLE_POLLING", "1")
-
-    token = ask(vals, "BOT_TOKEN", "1/3 貼上機器人 token（@BotFather 給的）", check_token)
-    ask(vals, "CHANNEL_ID", "    要貼到的群組 / 頻道 id（-100 開頭；留空＝下載結果直接傳回跟機器人的私訊）",
-        lambda c: check_chat(token, c), optional=True)
-    print("\n到 https://my.telegram.org → API development tools 拿下面兩個值。")
-    ask(vals, "TELEGRAM_API_ID", "2/3 api_id（一串數字）")
-    ask(vals, "TELEGRAM_API_HASH", "3/3 api_hash（32 個英數字）")
-    write_env(vals)  # 先存一次，登入失敗也不會白填
-
-    # 機器人自己的 id（token 冒號前那段）不能當成你的 id
-    ids = [x for x in vals.get("ALLOWED_USER_IDS", "").split(",") if x and x != token.split(":")[0]]
-    vals["ALLOWED_USER_IDS"] = ",".join(ids)
-    try:
-        uid = asyncio.run(login_user(vals))
-        if str(uid) not in ids:
-            ids.insert(0, str(uid))
-        vals["ALLOWED_USER_IDS"] = ",".join(ids)
-        vals["UPLOAD_AS_USER"] = "1"
-    except Exception as e:
-        print(f"\n⚠ 帳號登入沒有完成：{e}\n  先用機器人上傳（50MB 上限），之後可以再跑一次 configure.bat。")
-        vals["UPLOAD_AS_USER"] = "0"
-    if not vals["ALLOWED_USER_IDS"]:
-        del vals["ALLOWED_USER_IDS"]
-    write_env(vals)
-
-    print("\n✓ 設定已存到 .env。")
-    if not vals.get("ALLOWED_USER_IDS"):
-        print("  還差你的 user id：開 start.bat 後私訊機器人 /start，把它回的數字填進 ALLOWED_USER_IDS。")
-    print("  雙擊 restart.bat 讓背景的機器人套用新設定。")
+    lines = read_lines()
+    cur = current_token(lines)
+    while True:
+        hint = f"（直接按 Enter 沿用 {cur[:4]}…{cur[-3:]}）" if cur else ""
+        token = input(f"貼上機器人 token（@BotFather 給的）{hint}：").strip() or cur
+        if not re.fullmatch(TOKEN_RE, token):
+            print("  格式不對，應該長得像 123456789:ABC...，請再貼一次。")
+            continue
+        name, err = check_token(token)
+        if err:
+            print(f"  {err}")
+            continue
+        break
+    save_token(lines, token)
+    print(f"\n✓ 機器人 @{name}，token 已存到 .env。")
+    print("接下來：")
+    print("  1. 雙擊 restart.bat，讓機器人在背景跑起來（右下角會出現圖示）。")
+    print(f"  2. 在 Telegram 打開 https://t.me/{name} 傳 /start。第一個傳的人就是主人。")
+    print("  3. 其他設定（傳到哪、群組、大檔案）在聊天裡打 /setup。")
 
 
 if __name__ == "__main__":

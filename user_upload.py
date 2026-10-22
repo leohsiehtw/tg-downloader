@@ -57,10 +57,8 @@ def _thumb(path: Path, folder):
 class Uploader:
     """在自己的執行緒裡一直跑一個 event loop，bot.py 好幾個執行緒可以同時呼叫（上傳和下載同時進行）。"""
 
-    def __init__(self, chat_id=None):
-        """chat_id 是預設要貼的群組 / 頻道；None 表示每次 send() 用 to 指定。"""
-        self.chat_id = int(chat_id) if str(chat_id).lstrip("-").isdigit() else chat_id
-        self.entities = {}
+    def __init__(self):
+        self.entities = {}  # 貼過的對象（群組 id、機器人 username）
         self.loop = asyncio.new_event_loop()
         threading.Thread(target=self.loop.run_forever, daemon=True).start()
         self._run(self._start())
@@ -75,7 +73,22 @@ class Uploader:
             raise RuntimeError("還沒登入 Telegram 帳號，請先執行 login.bat")
         self.me_id = (await self.client.get_me()).id
         await self.client.get_dialogs()  # 讓 telethon 認得群組 / 頻道 id
-        self.entity = await self.client.get_entity(self.chat_id) if self.chat_id else None
+
+    async def _entity(self, to):
+        if to not in self.entities:
+            key = int(to) if str(to).lstrip("-").isdigit() else to
+            try:
+                self.entities[to] = await self.client.get_entity(key)
+            except ValueError:  # 剛加入的群組，先重新整理一次對話清單
+                await self.client.get_dialogs()
+                self.entities[to] = await self.client.get_entity(key)
+        return self.entities[to]
+
+    def close(self):
+        try:
+            self._run(self.client.disconnect())
+        finally:
+            self.loop.call_soon_threadsafe(self.loop.stop)
 
     def _tick(self, p: Path, sent=0):
         """回報整批的上傳進度（給 bot.py 顯示在 Telegram 私訊裡）。"""
@@ -100,13 +113,7 @@ class Uploader:
             thumb=await self.client.upload_file(t) if t else None)
 
     async def _send(self, paths, caption, thread_id, to):
-        entity = self.entity
-        if to is not None:
-            if to not in self.entities:
-                self.entities[to] = await self.client.get_entity(to)
-            entity = self.entities[to]
-        if entity is None:
-            raise RuntimeError("不知道要貼到哪（沒設 CHANNEL_ID）")
+        entity = await self._entity(to)
         reply_to = thread_id or None
         album = [p for p in paths if p.suffix.lower() in VIDEO_EXT
                  or (p.suffix.lower() in IMAGE_EXT and p.stat().st_size <= PHOTO_MAX_BYTES)]
@@ -137,7 +144,7 @@ class Uploader:
 
     def send(self, paths, caption, thread_id=0, progress=None, to=None):
         """回傳 Telegram 確認收到的則數。progress(檔名, 第幾個, 共幾個, 已傳 bytes, 總 bytes) 用來顯示進度。
-        to：這次改貼到別的對象（例如機器人的 username，就是貼到你跟機器人的聊天）。"""
+        to：貼到哪，群組 id 或機器人的 username（就是貼到你跟機器人的聊天）。"""
         self.progress = progress or (lambda *a: None)
         return self._run(self._send(list(paths), caption, thread_id, to))
 
@@ -164,6 +171,59 @@ class Uploader:
     def download(self, bot, name, size, dest, origin=None, progress=None):
         """下載轉傳給機器人的檔案（機器人自己只能下載 20MB 以下）。progress(已下載 bytes, 總 bytes)。"""
         self._run(self._download(bot, name, size, origin, dest, progress))
+
+
+class Login:
+    """在聊天裡一步步登入你的帳號：phone() 寄驗證碼 → code() → 有兩步驟驗證的話再 password()。"""
+
+    def __init__(self, api_id, api_hash):
+        self.api = (int(api_id), api_hash)
+        self.loop = asyncio.new_event_loop()
+        threading.Thread(target=self.loop.run_forever, daemon=True).start()
+
+    def _run(self, coro):
+        return asyncio.run_coroutine_threadsafe(coro, self.loop).result()
+
+    async def _phone(self, phone):
+        self.client = TelegramClient(SESSION, *self.api)
+        await self.client.connect()
+        self.number = phone
+        self.hash = (await self.client.send_code_request(phone)).phone_code_hash
+
+    async def _code(self, code):
+        from telethon.errors import SessionPasswordNeededError
+        try:
+            await self.client.sign_in(self.number, code, phone_code_hash=self.hash)
+        except SessionPasswordNeededError:
+            return None
+        return await self._done()
+
+    async def _password(self, pw):
+        await self.client.sign_in(password=pw)
+        return await self._done()
+
+    async def _done(self):
+        me = await self.client.get_me()
+        await self.client.disconnect()
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        return me
+
+    def phone(self, phone):
+        self._run(self._phone(phone))
+
+    def code(self, code):
+        """登入成功回傳帳號；要兩步驟驗證密碼時回傳 None。"""
+        return self._run(self._code(code))
+
+    def password(self, pw):
+        return self._run(self._password(pw))
+
+    def close(self):
+        try:
+            self._run(self.client.disconnect())
+        except Exception:
+            pass
+        self.loop.call_soon_threadsafe(self.loop.stop)
 
 
 def login():
