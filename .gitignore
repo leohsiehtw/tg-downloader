@@ -24,3 +24,6 @@ __pycache__/
 *.py[cod]
 .venv/
 .log-cleared
+.passwords.json
+.restart
+README-個人.md
