@@ -1,5 +1,6 @@
 """
-TG Downloader：把網址裡的影片 / 圖片下載下來，貼到指定的 Telegram 頻道。
+TG Downloader：把網址裡的影片 / 圖片下載下來，貼到指定的 Telegram 頻道；
+沒設 CHANNEL_ID 就直接傳回你跟機器人的私訊聊天。
 
 兩種收網址的方式（可同時開）：
   1. HTTP：iPhone 捷徑 POST /download  {"url": "..."}，header 帶 X-Secret
@@ -43,7 +44,7 @@ if _env.exists():
             os.environ.setdefault(k.strip(), v.strip())
 
 BOT_TOKEN = os.environ["BOT_TOKEN"]
-CHANNEL_ID = os.environ["CHANNEL_ID"]  # 例如 -1001234567890 或 @mychannel
+CHANNEL_ID = os.environ.get("CHANNEL_ID", "").strip()  # 例如 -1001234567890 或 @mychannel；留空＝傳回私訊聊天
 SHARED_SECRET = os.environ.get("SHARED_SECRET", "")
 ALLOWED_USER_IDS = {int(x) for x in os.environ.get("ALLOWED_USER_IDS", "").split(",") if x.strip()}
 PORT = int(os.environ.get("PORT", "8080"))
@@ -74,7 +75,7 @@ def _parse_topics(raw):
     return out
 
 
-TOPICS = _parse_topics(os.environ.get("TOPICS", ""))
+TOPICS = _parse_topics(os.environ.get("TOPICS", "")) if CHANNEL_ID else {}  # 私訊聊天沒有子頻道
 # 丟進這個資料夾的檔案，機器人會私訊問你要貼到哪個子頻道
 UPLOAD_DIR = Path(os.environ.get("UPLOAD_DIR") or Path(__file__).with_name("上傳"))
 FAILED_DIR = "失敗"
@@ -126,6 +127,11 @@ def default_topic():
 
 def topic_name(tid):
     return next((n for n, i in TOPICS.items() if i == tid), "")
+
+
+def place(tid):
+    """完成訊息裡「已傳到哪」。"""
+    return topic_name(tid) or ("頻道" if CHANNEL_ID else "這個聊天")
 
 
 def enqueue(what, chat, thread_id, msg_id=None):
@@ -506,14 +512,18 @@ def kind_of(path: Path):
     return "document"
 
 
-def target(thread_id):
-    d = {"chat_id": CHANNEL_ID}
-    if thread_id:
+def target(thread_id, chat=None):
+    """要貼到哪：有設 CHANNEL_ID 就貼到群組 / 頻道，沒設就傳回發送者的聊天。"""
+    dest = CHANNEL_ID or chat
+    if not dest:
+        raise RuntimeError("沒設 CHANNEL_ID，也不知道要傳回哪個聊天（ALLOWED_USER_IDS 是空的？）")
+    d = {"chat_id": dest}
+    if thread_id and CHANNEL_ID:
         d["message_thread_id"] = thread_id
     return d
 
 
-def send_files(paths, caption, thread_id=0):
+def send_files(paths, caption, thread_id=0, chat=None):
     """照片/影片每 10 個一組用相簿送，其餘逐一送。回傳 Telegram 確認收到的則數。"""
     group = [p for p in paths if kind_of(p) in ("photo", "video")]
     others = [p for p in paths if p not in group]
@@ -538,7 +548,7 @@ def send_files(paths, caption, thread_id=0):
                 files[key] = open(p, "rb")
         status(f"⬆️ 上傳中（相簿 {i // 10 + 1}，{len(batch)} 個檔案）")
         try:
-            sent += len(tg("sendMediaGroup", {**target(thread_id), "media": json.dumps(media)}, files or None))
+            sent += len(tg("sendMediaGroup", {**target(thread_id, chat), "media": json.dumps(media)}, files or None))
         finally:
             for f in files.values():
                 f.close()
@@ -548,7 +558,7 @@ def send_files(paths, caption, thread_id=0):
         k = kind_of(p)
         method = {"photo": "sendPhoto", "video": "sendVideo",
                   "animation": "sendAnimation", "document": "sendDocument"}[k]
-        data = target(thread_id)
+        data = target(thread_id, chat)
         if first:
             data["caption"] = caption
         if k == "video":
@@ -897,22 +907,24 @@ def download(url, folder: Path):
     raise RuntimeError("下載不到任何媒體\n" + "\n".join(errors))
 
 
-def upload(files, caption, thread_id):
-    """上傳到頻道；超過上限的不傳，回傳 (已上傳, 太大) 兩個清單。"""
+def upload(files, caption, thread_id, chat=None):
+    """上傳到頻道（沒設 CHANNEL_ID 就傳回 chat）；超過上限的不傳，回傳 (已上傳, 太大) 兩個清單。"""
     too_big = [p for p in files if p.stat().st_size > MAX_BYTES]
     ok = [p for p in files if p not in too_big]
     if ok:
         status(f"⬆️ 上傳中（{len(ok)} 個檔案，{human(sum(p.stat().st_size for p in ok))}）")
-        if UPLOAD_AS_USER:
-            sent = user_uploader().send(ok, caption=caption, thread_id=thread_id, progress=upload_meter())
+        if UPLOAD_AS_USER and (CHANNEL_ID or chat == user_uploader().me_id):
+            # 私訊模式下，用你的帳號貼到你跟機器人的聊天（只有登入的那個帳號能這樣傳）
+            sent = user_uploader().send(ok, caption=caption, thread_id=thread_id, progress=upload_meter(),
+                                        to=None if CHANNEL_ID else BOT_USERNAME)
         else:
-            sent = send_files(ok, caption=caption, thread_id=thread_id)
+            sent = send_files(ok, caption=caption, thread_id=thread_id, chat=chat)
         if sent != len(ok):
             raise RuntimeError(f"只確認到 {sent}/{len(ok)} 個檔案上傳成功")
         count(files=len(ok), bytes=total_size(ok))
     if too_big:
         names = ", ".join(f"{p.name} ({p.stat().st_size // 1048576}MB)" for p in too_big)
-        tg("sendMessage", {**target(thread_id),
+        tg("sendMessage", {**target(thread_id, chat),
                            "text": f"{caption}\n⚠️ 超過 {MAX_UPLOAD_MB}MB 上傳上限，未上傳：{names}".strip()})
     return ok, too_big
 
@@ -936,9 +948,9 @@ def handle(url, reply_chat, thread_id=0):
 
     def send():
         try:
-            ok, _ = upload(files, url, thread_id)
+            ok, _ = upload(files, url, thread_id, reply_chat)
             squeezed = "，影片超過上限有壓縮畫質" if any(p.name.endswith(".small.mp4") for p in ok) else ""
-            notify(reply_chat, f"✅ 已傳到{topic_name(thread_id) or '頻道'}"
+            notify(reply_chat, f"✅ 已傳到{place(thread_id)}"
                                f"（{len(ok)} 個檔案，{human(total_size(ok))}{squeezed}）\n{url}")
         except Exception as e:
             failed(e)
@@ -956,7 +968,7 @@ def user_uploader():
     with _uploader_lock:  # 上傳和下載壓縮檔的執行緒可能同時要用
         if _uploader is None:
             from user_upload import Uploader
-            _uploader = Uploader(CHANNEL_ID)
+            _uploader = Uploader(CHANNEL_ID or None)
     return _uploader
 
 
@@ -1001,7 +1013,7 @@ def handle_files(paths, reply_chat, thread_id=0):
 
 def send_folder(sendable, paths, names, tmp, failed, reply_chat, thread_id):
     try:
-        ok, too_big = upload(sendable, "", thread_id)
+        ok, too_big = upload(sendable, "", thread_id, reply_chat)
         size = human(total_size(ok))  # 先算好，原檔等一下會丟進回收筒
         if any(p.name.endswith(".small.mp4") for p in ok):
             size += "，影片超過上限有壓縮畫質"
@@ -1012,7 +1024,7 @@ def send_folder(sendable, paths, names, tmp, failed, reply_chat, thread_id):
             return
         for p in paths:
             trash(p)
-        notify(reply_chat, f"✅ {len(ok)} 個檔案（{size}）全部傳到{topic_name(thread_id) or '頻道'}，"
+        notify(reply_chat, f"✅ {len(ok)} 個檔案（{size}）全部傳到{place(thread_id)}，"
                            f"原檔已丟進資源回收筒：{names}")
     except Exception as e:
         failed(e)
@@ -1225,10 +1237,10 @@ def handle_archive(job, reply_chat, thread_id=0):
 
     def send():
         try:
-            ok, _ = upload(files, caption, thread_id)
+            ok, _ = upload(files, caption, thread_id, reply_chat)
             photos = sum(1 for p in ok if p.suffix.lower() in IMAGE_EXT | GIF_EXT)
             key = f"，密碼 {pw}" if pw else ""
-            notify(reply_chat, f"✅ {job.name} 解壓後已傳到{topic_name(thread_id) or '頻道'}"
+            notify(reply_chat, f"✅ {job.name} 解壓後已傳到{place(thread_id)}"
                                f"（圖片 {photos} 張、影片 {len(ok) - photos} 支，{human(total_size(ok))}{key}）")
         except Exception as e:
             failed(e)
@@ -1675,7 +1687,8 @@ def on_message(msg):
         _topic_hint[chat["id"]] = (find_topic(plain), time.time())
         return
     if not urls:
-        hint = "傳一個連結，或轉傳 zip / 7z / rar 壓縮檔給我，我會下載後貼到頻道。"
+        hint = ("傳一個連結，或轉傳 zip / 7z / rar 壓縮檔給我，我會下載後"
+                + ("貼到頻道。" if CHANNEL_ID else "傳回這裡。"))
         if TOPICS:
             hint += "\n連結前後加上子頻道名稱（" + "、".join(TOPICS) + "）就會直接貼到那裡。"
         hint += "\n/status 看進度和電腦狀態，/restart 重新啟動。"
@@ -1745,7 +1758,8 @@ def main():
             sys.exit(2)
     global BOT_USERNAME
     BOT_USERNAME = me["username"]
-    log.info("機器人 @%s 啟動，頻道 %s，子頻道 %s", me["username"], CHANNEL_ID, TOPICS or "（未設定）")
+    log.info("機器人 @%s 啟動，頻道 %s，子頻道 %s", me["username"], CHANNEL_ID or "（未設定，傳回私訊聊天）",
+             TOPICS or "（未設定）")
     try:  # 私訊機器人時，輸入框旁的選單會列出這些指令
         tg("setMyCommands", {"commands": json.dumps([
             {"command": "status", "description": "看進度和電腦狀態（CPU、RAM、GPU）"},

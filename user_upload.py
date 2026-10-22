@@ -57,8 +57,10 @@ def _thumb(path: Path, folder):
 class Uploader:
     """在自己的執行緒裡一直跑一個 event loop，bot.py 好幾個執行緒可以同時呼叫（上傳和下載同時進行）。"""
 
-    def __init__(self, chat_id):
+    def __init__(self, chat_id=None):
+        """chat_id 是預設要貼的群組 / 頻道；None 表示每次 send() 用 to 指定。"""
         self.chat_id = int(chat_id) if str(chat_id).lstrip("-").isdigit() else chat_id
+        self.entities = {}
         self.loop = asyncio.new_event_loop()
         threading.Thread(target=self.loop.run_forever, daemon=True).start()
         self._run(self._start())
@@ -71,8 +73,9 @@ class Uploader:
         await self.client.connect()
         if not await self.client.is_user_authorized():
             raise RuntimeError("還沒登入 Telegram 帳號，請先執行 login.bat")
+        self.me_id = (await self.client.get_me()).id
         await self.client.get_dialogs()  # 讓 telethon 認得群組 / 頻道 id
-        self.entity = await self.client.get_entity(self.chat_id)
+        self.entity = await self.client.get_entity(self.chat_id) if self.chat_id else None
 
     def _tick(self, p: Path, sent=0):
         """回報整批的上傳進度（給 bot.py 顯示在 Telegram 私訊裡）。"""
@@ -96,7 +99,14 @@ class Uploader:
                         DocumentAttributeFilename(p.name)],
             thumb=await self.client.upload_file(t) if t else None)
 
-    async def _send(self, paths, caption, thread_id):
+    async def _send(self, paths, caption, thread_id, to):
+        entity = self.entity
+        if to is not None:
+            if to not in self.entities:
+                self.entities[to] = await self.client.get_entity(to)
+            entity = self.entities[to]
+        if entity is None:
+            raise RuntimeError("不知道要貼到哪（沒設 CHANNEL_ID）")
         reply_to = thread_id or None
         album = [p for p in paths if p.suffix.lower() in VIDEO_EXT
                  or (p.suffix.lower() in IMAGE_EXT and p.stat().st_size <= PHOTO_MAX_BYTES)]
@@ -110,14 +120,14 @@ class Uploader:
                 group = album[i:i + 10]
                 batch = [await self._media(p, tmp) for p in group]
                 self._tick(group[-1])
-                r = await self.client.send_file(self.entity, batch if len(batch) > 1 else batch[0],
+                r = await self.client.send_file(entity, batch if len(batch) > 1 else batch[0],
                                                 caption=(caption or None) if first else None,
                                                 reply_to=reply_to, supports_streaming=True)
                 self.done += sum(p.stat().st_size for p in group if p.suffix.lower() not in VIDEO_EXT)
                 sent += len(r) if isinstance(r, list) else 1
                 first = False
         for p in others:  # gif、太大的圖片和其他檔案逐一送
-            await self.client.send_file(self.entity, str(p), caption=(caption or None) if first else None,
+            await self.client.send_file(entity, str(p), caption=(caption or None) if first else None,
                                         reply_to=reply_to, force_document=p.suffix.lower() in IMAGE_EXT,
                                         progress_callback=lambda s, _, p=p: self._tick(p, s))
             self.done += p.stat().st_size
@@ -125,10 +135,11 @@ class Uploader:
             first = False
         return sent
 
-    def send(self, paths, caption, thread_id=0, progress=None):
-        """回傳 Telegram 確認收到的則數。progress(檔名, 第幾個, 共幾個, 已傳 bytes, 總 bytes) 用來顯示進度。"""
+    def send(self, paths, caption, thread_id=0, progress=None, to=None):
+        """回傳 Telegram 確認收到的則數。progress(檔名, 第幾個, 共幾個, 已傳 bytes, 總 bytes) 用來顯示進度。
+        to：這次改貼到別的對象（例如機器人的 username，就是貼到你跟機器人的聊天）。"""
         self.progress = progress or (lambda *a: None)
-        return self._run(self._send(list(paths), caption, thread_id))
+        return self._run(self._send(list(paths), caption, thread_id, to))
 
     async def _find(self, bot, name, size, origin):
         """機器人收到的檔案，在你跟機器人的對話裡用大小和檔名找回同一則；找不到再去原本的頻道找。"""

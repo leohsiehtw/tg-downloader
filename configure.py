@@ -54,11 +54,14 @@ def mask(v):
     return v[:4] + "…" + v[-3:] if len(v) > 10 else v
 
 
-def ask(vals, key, prompt, check=None):
+def ask(vals, key, prompt, check=None, optional=False):
     cur = vals.get(key, "")
     while True:
-        hint = f"（直接按 Enter 沿用 {mask(cur)}）" if cur else ""
+        hint = f"（直接按 Enter 沿用 {mask(cur)}）" if cur else ("（不用就直接按 Enter）" if optional else "")
         v = input(f"{prompt}{hint}：").strip() or cur
+        if optional and not v:
+            vals.pop(key, None)
+            return ""
         if not looks_ok(key, v):
             print("  格式不對，請再貼一次。")
             continue
@@ -103,10 +106,11 @@ async def login_user(vals):
     me = await client.get_me()
     print(f"  ✓ 已登入：{me.first_name}（id {me.id}）")
     try:
-        await client.get_dialogs()
-        chat = vals["CHANNEL_ID"]
-        await client.get_entity(int(chat) if chat.lstrip("-").isdigit() else chat)
-        print("  ✓ 你的帳號找得到這個群組")
+        chat = vals.get("CHANNEL_ID")
+        if chat:
+            await client.get_dialogs()
+            await client.get_entity(int(chat) if chat.lstrip("-").isdigit() else chat)
+            print("  ✓ 你的帳號找得到這個群組")
     except Exception:
         print("  ⚠ 你的帳號找不到這個群組，請確認你在群組裡。")
     await client.disconnect()
@@ -118,10 +122,10 @@ def main():
     vals = read_env()
     vals.setdefault("PORT", "8080")
     vals.setdefault("ENABLE_POLLING", "1")
-    vals.setdefault("TOPICS", "Q:11643,A:12635,Ns:14878,頂:14323,General:0")
 
     token = ask(vals, "BOT_TOKEN", "1/3 貼上機器人 token（@BotFather 給的）", check_token)
-    ask(vals, "CHANNEL_ID", "    群組 id（-100 開頭）", lambda c: check_chat(token, c))
+    ask(vals, "CHANNEL_ID", "    要貼到的群組 / 頻道 id（-100 開頭；留空＝下載結果直接傳回跟機器人的私訊）",
+        lambda c: check_chat(token, c), optional=True)
     print("\n到 https://my.telegram.org → API development tools 拿下面兩個值。")
     ask(vals, "TELEGRAM_API_ID", "2/3 api_id（一串數字）")
     ask(vals, "TELEGRAM_API_HASH", "3/3 api_hash（32 個英數字）")
