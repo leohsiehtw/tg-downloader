@@ -22,6 +22,9 @@ HEARTBEAT = HERE / ".heartbeat"  # 執行中每分鐘更新；正常結束會刪
 NO_WINDOW = 0x08000000  # CREATE_NO_WINDOW：不跳黑色視窗
 COLORS = {"running": (46, 204, 113), "waiting": (241, 196, 15), "error": (231, 76, 60)}
 RESTART_CODE = 4  # bot.py 收到 /restart 時用這個代碼結束
+LOG_KEEP_DAYS = 2  # bot.log 每幾天清一次
+LOG_CLEARED = HERE / ".log-cleared"  # 上次清 bot.log 的時間
+_log_lock = threading.Lock()
 
 
 def read_env():
@@ -36,13 +39,40 @@ def read_env():
     return vals
 
 
+def clear_old_log():
+    """bot.log 每 LOG_KEEP_DAYS 天清一次（太大也清）。"""
+    now = time.time()
+    try:
+        last = float(LOG_CLEARED.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        LOG_CLEARED.write_text(str(now), encoding="utf-8")  # 第一次：從現在開始算
+        return
+    too_big = LOG.exists() and LOG.stat().st_size > 5_000_000
+    if now - last >= LOG_KEEP_DAYS * 86400 or too_big:
+        stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        LOG.write_text(f"{stamp} [工作列] 清空舊紀錄（每 {LOG_KEEP_DAYS} 天清一次）\n", encoding="utf-8")
+        LOG_CLEARED.write_text(str(now), encoding="utf-8")
+
+
+def append_log(text):
+    with _log_lock:
+        try:
+            clear_old_log()
+            with open(LOG, "a", encoding="utf-8") as f:
+                f.write(text)
+        except OSError:
+            pass
+
+
 def write_log(text):
     stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        with open(LOG, "a", encoding="utf-8") as f:
-            f.write(f"{stamp} [工作列] {text}\n")
-    except OSError:
-        pass
+    append_log(f"{stamp} [工作列] {text}\n")
+
+
+def pump_log(stream):
+    """把 bot.py 的輸出一行行寫進 bot.log。不一直開著 bot.log，才能隨時清掉它。"""
+    for line in iter(stream.readline, b""):
+        append_log(line.decode("utf-8", "replace").rstrip("\r\n") + "\n")
 
 
 def last_log_lines(n=8):
@@ -105,17 +135,14 @@ class Runner:
         threading.Thread(target=self.heartbeat, daemon=True).start()
         write_log("啟動")
         while not self.quitting:
-            try:
-                if LOG.exists() and LOG.stat().st_size > 5_000_000:
-                    LOG.unlink()
-            except OSError:
-                pass
-            with open(LOG, "a", encoding="utf-8") as log:
-                self.proc = subprocess.Popen(
-                    [python_exe(), "-X", "utf8", "-u", str(HERE / "bot.py")],
-                    cwd=HERE, stdout=log, stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
-                self.set("running", "執行中")
-                rc = self.proc.wait()
+            self.proc = subprocess.Popen(
+                [python_exe(), "-X", "utf8", "-u", str(HERE / "bot.py")],
+                cwd=HERE, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=NO_WINDOW)
+            pump = threading.Thread(target=pump_log, args=(self.proc.stdout,), daemon=True)
+            pump.start()
+            self.set("running", "執行中")
+            rc = self.proc.wait()
+            pump.join(5)  # 最後幾行寫完再往下
             if self.quitting:
                 break
             if rc == RESTART_CODE:  # 從 Telegram 要求重新啟動：連圖示一起重開，順便更新下載工具

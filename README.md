@@ -106,7 +106,7 @@ ffmpeg、7-Zip 和 Python 套件會在第一次設定時自動安裝（透過 wi
 | `stop.bat` | 停止機器人 |
 | `start.bat` | 在視窗裡前景執行、看即時紀錄（先跑 `stop.bat`） |
 | 右下角藍色圖示 | 綠點＝執行中、黃點＝重開中、紅點＝停住了（滑鼠移上去看原因）。右鍵可以看紀錄、重新啟動、結束 |
-| `bot.log` | 執行紀錄 |
+| `bot.log` | 執行紀錄，每 2 天自動清一次（超過 5MB 也會清） |
 | `bot.py`、`tray.pyw`、`user_upload.py`、`configure.py`、`start-hidden.vbs` | 程式本體 |
 
 **不要傳給任何人的檔案**（都已列在 `.gitignore`）：`.env`（token 與設定）、`user.session`（你 Telegram 帳號的登入狀態）、`.passwords.json`、`cookies` 資料夾。
