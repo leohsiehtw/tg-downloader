@@ -1,9 +1,10 @@
 # 更新紀錄
 
-## [Unreleased]
+## [1.0.1] - 2026-10-22
 
 ### 變更
 - 下載因為登入失敗時（例如 Instagram 換帳號後舊 cookies 作廢），失敗訊息會指出是哪個 cookies 檔、什麼時候匯出的，以及問題是沒放 cookies、匯出時沒登入、已過期，還是網站不認（換帳號、登出過、要驗證），並說明怎麼重新匯出。
+- 按下子頻道等按鈕會馬上有反應：所有請求共用同一條連線，不用每按一次就重新連到 Telegram。
 
 ## [1.0.0] - 2026-10-22
 
@@ -29,4 +30,5 @@
 ### 修正
 - 私訊模式下，允許名單裡的其他人不會再嘗試用主人的帳號傳檔。
 
+[1.0.1]: https://github.com/leohsiehtw/tg-downloader/releases/tag/v1.0.1
 [1.0.0]: https://github.com/leohsiehtw/tg-downloader/releases/tag/v1.0.0
