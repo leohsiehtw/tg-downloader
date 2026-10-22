@@ -31,6 +31,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 
@@ -621,9 +622,7 @@ def cookie_file():
     """每次下載前看一下 cookies 資料夾（只比對修改時間，幾乎不花時間）；有換檔才重新合併，不用重啟。"""
     if COOKIES_FILE:
         return COOKIES_FILE
-    # 舊版放在主資料夾、檔名有 cookies 的 .txt 也照樣讀
-    found = list(COOKIE_DIR.glob("*.txt")) + list(Path(__file__).parent.glob("*cookies*.txt"))
-    sources = sorted((p for p in found if not p.name.startswith(".")), key=lambda p: p.name)
+    sources = cookie_sources()
     try:
         stamp = [(p.name, p.stat().st_mtime_ns, p.stat().st_size) for p in sources]
         if stamp != _cookies[0]:
@@ -907,7 +906,63 @@ def download(url, folder: Path):
             log.info("%s 下載到 %d 個檔案", name, len(found))
             return [make_playable(p) for p in found]
         errors.append(f"{name}: {(r.stderr or r.stdout).strip()[-300:]}")
-    raise RuntimeError("下載不到任何媒體\n" + "\n".join(errors))
+    raise RuntimeError("下載不到任何媒體\n" + "\n".join(errors) + login_hint(url, errors))
+
+
+# 各網站代表「有登入」的那個 cookie；匯出時沒登入就不會有它
+LOGIN_COOKIE = {"instagram.com": "sessionid", "threads.net": "sessionid", "threads.com": "sessionid",
+                "x.com": "auth_token", "twitter.com": "auth_token", "facebook.com": "c_user",
+                "tiktok.com": "sessionid", "youtube.com": "SID", "pixiv.net": "PHPSESSID"}
+
+
+def cookie_sources():
+    """cookies 資料夾裡的 .txt；舊版放在主資料夾、檔名有 cookies 的 .txt 也照樣讀。"""
+    if COOKIES_FILE:
+        return [Path(COOKIES_FILE)]
+    found = list(COOKIE_DIR.glob("*.txt")) + list(Path(__file__).parent.glob("*cookies*.txt"))
+    return sorted((p for p in found if not p.name.startswith(".")), key=lambda p: p.name)
+
+
+def login_hint(url, errors):
+    """被導去登入頁 = 網站不認 cookies；看 cookies 檔判斷是沒放、匯出時沒登入、過期，還是被網站作廢。"""
+    text = "\n".join(errors).lower()
+    if not any(k in text for k in ("login", "log in", "logged in", "requested content is not available", "401")):
+        return ""
+    host = (urlparse(url).hostname or "").lower()
+    site = ".".join(host.split(".")[-2:])
+    want = LOGIN_COOKIE.get(site)
+    hits = []  # (檔案, 這個網站的 cookies {名稱: 到期時間})
+    for p in cookie_sources():
+        try:
+            lines = p.read_text(encoding="utf-8-sig", errors="replace").splitlines()
+        except OSError:
+            continue
+        found = {}
+        for line in lines:
+            f = line.removeprefix("#HttpOnly_").split("\t")
+            if len(f) >= 7 and not line.startswith("# ") and f[0].lstrip(".").endswith(site):
+                found[f[5]] = int(f[4]) if f[4].isdigit() else 0
+        if found:
+            hits.append((p, found))
+    where = f"cookies\\www.{site}_cookies.txt"
+    fix = f"請在瀏覽器登入 {site}，確認能正常瀏覽後重新匯出 cookies，覆蓋 {{}}，不用重啟。"
+    if not hits:
+        return f"\n\n🔑 Cookie 問題：沒有 {site} 的 cookies。" + fix.format(where)
+    # 有登入 cookie 的那份才是實際在用的；有好幾份時，合併後排後面的會蓋掉前面的
+    p, found = ([h for h in hits if want in h[1]] or hits)[-1]
+    name = p.name if p.parent == COOKIE_DIR else str(p)
+    day = time.strftime("%Y-%m-%d", time.localtime(p.stat().st_mtime))
+    head = f"\n\n🔑 Cookie 問題（{name}，{day} 匯出）："
+    if want and want not in found:
+        why = f"裡面沒有登入用的 {want}，匯出時這個瀏覽器沒有登入 {site}。"
+    elif want and 0 < found[want] < time.time():
+        why = f"登入用的 {want} 在 {time.strftime('%Y-%m-%d', time.localtime(found[want]))} 就過期了。"
+    elif want:
+        why = (f"登入用的 {want} 還沒到期，但 {site} 不認它，通常是換過帳號、在瀏覽器登出過，"
+               "或帳號被要求驗證（手機 / email）。")
+    else:
+        why = f"{site} 把下載導去登入頁，這份 cookies 的登入大概失效了。"
+    return head + why + fix.format(name)
 
 
 def upload(files, caption, thread_id, chat=None):
