@@ -1,0 +1,9 @@
+requests>=2.31
+yt-dlp
+gallery-dl
+telethon
+cryptg
+pystray
+pillow
+send2trash
+psutil

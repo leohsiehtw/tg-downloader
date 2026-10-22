@@ -1,0 +1,25 @@
+# 機密：token、帳號登入狀態、網站 cookies
+.env
+*.session
+*.session-journal
+user.session*
+cookies/
+cookies.txt
+*cookies*.txt
+.cookies*.txt
+
+# 執行資料
+.versions.json
+.totals.json
+.heartbeat
+*.log
+上傳/
+.backup-archive/
+
+# 大型執行檔
+ffmpeg-gpu/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
