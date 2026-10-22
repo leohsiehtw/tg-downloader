@@ -157,17 +157,17 @@ def wait_note():
 
 # ---------------- Telegram ----------------
 
-_http = threading.local()  # 每個執行緒留一條和 Telegram 的連線重複用，不用每次重新連線（回覆快很多）
+# 所有執行緒共用一組和 Telegram 的連線。每則訊息、每個按鈕都在新的執行緒處理，
+# 以前每個執行緒各開一條新連線（查 DNS + TLS 握手），按鈕按下去要等好幾秒才有反應。
+_http = requests.Session()
+_http.mount("https://", requests.adapters.HTTPAdapter(pool_connections=1, pool_maxsize=32))
 
 
 def tg(method, data=None, files=None, timeout=300):
     for attempt in range(3):
-        if not hasattr(_http, "session"):
-            _http.session = requests.Session()
         try:
-            r = _http.session.post(f"{API}/{method}", data=data, files=files, timeout=timeout)
+            r = _http.post(f"{API}/{method}", data=data, files=files, timeout=timeout)
         except requests.RequestException as e:
-            _http.__dict__.pop("session", None)
             if attempt == 0 and not files and isinstance(e, requests.ConnectionError):
                 continue  # 放太久的連線被斷掉了，重新連一次
             # 錯誤訊息裡的網址含 token，記錄前先遮掉
@@ -1841,10 +1841,8 @@ def on_callback(cb):
     data = cb.get("data") or ""
     msg = cb.get("message") or {}
     chat = msg.get("chat", {}).get("id")
-    try:
-        tg("answerCallbackQuery", {"callback_query_id": cb["id"]})
-    except Exception:
-        pass
+    if not data.startswith("t|"):  # 子頻道按鈕在下面回，順便跳出選了哪裡
+        answer(cb)
     if data.startswith("r|"):
         return on_restart_button(data[2:], chat, msg.get("message_id"))
     if data.startswith("s|"):
@@ -1858,12 +1856,20 @@ def on_callback(cb):
     _, key, name = data.split("|", 2)
     url = pending.pop(key, None)
     if url is None or name not in TOPICS:
+        answer(cb)
         return notify(chat, "這個按鈕過期了，請重傳連結或檔案。")
-    label = job_label(url)
-    note = wait_note()
-    if note:  # 這則訊息輪到它時會變成進度顯示
-        edit(chat, msg["message_id"], f"⏳ {label} → {name}\n{note}")
+    answer(cb, f"→ {name}")
+    # 馬上把按鈕換成「已選好」，輪到它時這則訊息會變成進度顯示
+    edit(chat, msg["message_id"], f"⏳ {job_label(url)} → {name}\n{wait_note() or '準備中…'}")
     enqueue(url, chat, TOPICS[name], msg["message_id"])
+
+
+def answer(cb, text=None):
+    """讓按鈕停止轉圈圈；有 text 的話手機上方會短暫跳出這句。"""
+    try:
+        tg("answerCallbackQuery", {"callback_query_id": cb["id"], **({"text": text} if text else {})})
+    except Exception:
+        pass
 
 
 def on_message(msg):
