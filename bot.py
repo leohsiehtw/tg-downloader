@@ -52,7 +52,9 @@ ENABLE_POLLING = os.environ.get("ENABLE_POLLING", "1") == "1"
 # 官方 Bot API 上傳上限 50MB；自架 telegram-bot-api 可到 2000MB
 API_BASE = os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org").rstrip("/")
 # 設 1 就改用你自己的帳號上傳（要先跑 login.bat），上限 2GB
-UPLOAD_AS_USER = os.environ.get("UPLOAD_AS_USER", "0") == "1"
+# UPLOAD_AS_USER：0＝全部機器人傳；big＝50MB 以下機器人傳、超過才用你的帳號；1＝全部用你的帳號
+UPLOAD_AS_USER = os.environ.get("UPLOAD_AS_USER", "0") in ("1", "big")
+ONLY_BIG_AS_USER = os.environ.get("UPLOAD_AS_USER", "0") == "big"
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "2000" if UPLOAD_AS_USER else "50"))
 # 選用：IG / X 等需要登入的網站。匯出的 cookies 檔丟進 cookies 資料夾就好（檔名隨意），
 # 下載工具會依網址自己挑那個網站的 cookies。設了 COOKIES_FILE 就只用那個檔。
@@ -60,6 +62,7 @@ COOKIES_FILE = os.environ.get("COOKIES_FILE") or None
 COOKIE_DIR = Path(__file__).with_name("cookies")
 # 自架 telegram-bot-api 用 --local 跑在同一台電腦時設 1：直接給檔案路徑，不必整個檔案讀進記憶體上傳
 LOCAL_BOT_API = os.environ.get("LOCAL_BOT_API", "0") == "1"
+BOT_MAX_BYTES = (2000 if LOCAL_BOT_API else 50) * 1024 * 1024  # 機器人自己能傳的上限
 TEMP_DIR = os.environ.get("TEMP_DIR") or None  # 下載暫存資料夾，預設系統暫存
 DOCKER_PATH_PREFIX = os.environ.get("DOCKER_PATH_PREFIX", "").rstrip("/")  # TEMP_DIR 在 Docker 裡的路徑
 
@@ -909,23 +912,28 @@ def download(url, folder: Path):
 
 def upload(files, caption, thread_id, chat=None):
     """上傳到頻道（沒設 CHANNEL_ID 就傳回 chat）；超過上限的不傳，回傳 (已上傳, 太大) 兩個清單。"""
-    too_big = [p for p in files if p.stat().st_size > MAX_BYTES]
+    # 私訊模式下，你的帳號只能貼到你自己跟機器人的聊天；其他人的聊天一律機器人傳
+    as_user = UPLOAD_AS_USER and (CHANNEL_ID or chat == user_uploader().me_id)
+    limit = MAX_BYTES if as_user else BOT_MAX_BYTES
+    too_big = [p for p in files if p.stat().st_size > limit]
     ok = [p for p in files if p not in too_big]
     if ok:
         status(f"⬆️ 上傳中（{len(ok)} 個檔案，{human(sum(p.stat().st_size for p in ok))}）")
-        if UPLOAD_AS_USER and (CHANNEL_ID or chat == user_uploader().me_id):
-            # 私訊模式下，用你的帳號貼到你跟機器人的聊天（只有登入的那個帳號能這樣傳）
-            sent = user_uploader().send(ok, caption=caption, thread_id=thread_id, progress=upload_meter(),
-                                        to=CHANNEL_ID or BOT_USERNAME)
-        else:
-            sent = send_files(ok, caption=caption, thread_id=thread_id, chat=chat)
+        by_user = [p for p in ok if as_user and (not ONLY_BIG_AS_USER or p.stat().st_size > BOT_MAX_BYTES)]
+        by_bot = [p for p in ok if p not in by_user]
+        sent = 0
+        if by_bot:
+            sent += send_files(by_bot, caption=caption, thread_id=thread_id, chat=chat)
+        if by_user:
+            sent += user_uploader().send(by_user, caption="" if by_bot else caption, thread_id=thread_id,
+                                         progress=upload_meter(), to=CHANNEL_ID or BOT_USERNAME)
         if sent != len(ok):
             raise RuntimeError(f"只確認到 {sent}/{len(ok)} 個檔案上傳成功")
         count(files=len(ok), bytes=total_size(ok))
     if too_big:
         names = ", ".join(f"{p.name} ({p.stat().st_size // 1048576}MB)" for p in too_big)
         tg("sendMessage", {**target(thread_id, chat),
-                           "text": f"{caption}\n⚠️ 超過 {MAX_UPLOAD_MB}MB 上傳上限，未上傳：{names}".strip()})
+                           "text": f"{caption}\n⚠️ 超過 {limit // 1048576}MB 上傳上限，未上傳：{names}".strip()})
     return ok, too_big
 
 
@@ -1154,7 +1162,7 @@ def fetch_parts(job):
     for i, part in enumerate(job.parts, 1):
         dest = job.folder / part["name"]
         report = download_meter(part["name"], i, len(job.parts), before, total)
-        if UPLOAD_AS_USER:
+        if UPLOAD_AS_USER and (not ONLY_BIG_AS_USER or part["size"] > BOT_API_FILE_MAX):
             user_uploader().download(BOT_USERNAME, part["orig_name"], part["size"], dest,
                                      part["origin"], report)
         else:
@@ -1164,7 +1172,7 @@ def fetch_parts(job):
 
 def bot_download(part, dest, report):
     if part["size"] > BOT_API_FILE_MAX and not LOCAL_BOT_API:
-        raise RuntimeError("機器人自己只能下載 20MB 以下的檔案；大檔要在 .env 設 UPLOAD_AS_USER=1（用你的帳號下載）")
+        raise RuntimeError("機器人自己只能下載 20MB 以下的檔案；大檔要先在 /setup 登入你的帳號")
     path = tg("getFile", {"file_id": part["file_id"]})["file_path"]
     if LOCAL_BOT_API and os.path.isabs(path):
         shutil.copyfile(path, dest)
@@ -1620,12 +1628,13 @@ setup_state = {}  # 私訊裡正在設定的人：chat id → {"step": ..., "log
 
 def apply_env():
     """照 os.environ 重新算一次會在聊天裡改的設定（不用重開）。"""
-    global CHANNEL_ID, TOPICS, UPLOAD_AS_USER, MAX_UPLOAD_MB, MAX_BYTES
+    global CHANNEL_ID, TOPICS, UPLOAD_AS_USER, ONLY_BIG_AS_USER, MAX_UPLOAD_MB, MAX_BYTES
     CHANNEL_ID = os.environ.get("CHANNEL_ID", "").strip()
     TOPICS = _parse_topics(os.environ.get("TOPICS", "")) if CHANNEL_ID else {}
     ALLOWED_USER_IDS.clear()
     ALLOWED_USER_IDS.update(int(x) for x in os.environ.get("ALLOWED_USER_IDS", "").split(",") if x.strip())
-    UPLOAD_AS_USER = os.environ.get("UPLOAD_AS_USER", "0") == "1"
+    UPLOAD_AS_USER = os.environ.get("UPLOAD_AS_USER", "0") in ("1", "big")
+    ONLY_BIG_AS_USER = os.environ.get("UPLOAD_AS_USER", "0") == "big"
     MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "2000" if UPLOAD_AS_USER else "50"))
     MAX_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 
@@ -1649,14 +1658,42 @@ def save_env(**kv):
 def setup_text():
     where = "這個聊天（私訊）" if not CHANNEL_ID else f"群組 {CHANNEL_ID}"
     subs = "、".join(TOPICS) if TOPICS else "（沒有）"
-    big = f"開（用你的帳號傳，上限 {MAX_UPLOAD_MB}MB）" if UPLOAD_AS_USER else f"關（機器人傳，上限 {MAX_UPLOAD_MB}MB）"
-    return (f"⚙️ 目前設定\n下載結果傳到：{where}\n子頻道：{subs}\n大檔案：{big}\n\n要改哪一項？")
+    return (f"⚙️ 目前設定\n下載結果傳到：{where}\n子頻道：{subs}\n上傳身分：{UPLOAD_MODES[upload_mode()]}"
+            f"（上限 {MAX_UPLOAD_MB}MB）\n\n要改哪一項？")
+
+
+UPLOAD_MODES = {"0": "全部機器人傳", "big": "50MB 以下機器人傳，大檔用你的帳號", "1": "全部用你的帳號"}
+
+
+def upload_mode():
+    mode = os.environ.get("UPLOAD_AS_USER", "0")
+    return mode if mode in UPLOAD_MODES else "0"
+
+
+def logged_in():
+    return (bool(os.environ.get("TELEGRAM_API_ID")) and Path(__file__).with_name("user.session").exists())
+
+
+def mode_keyboard():
+    return json.dumps({"inline_keyboard": [
+        [{"text": ("✅ " if upload_mode() == k else "") + v, "callback_data": f"m|{k}"}]
+        for k, v in UPLOAD_MODES.items()]})
+
+
+def on_mode_button(mode, chat, msg_id):
+    if mode not in UPLOAD_MODES:
+        return
+    if mode != "0" and not logged_in():
+        return edit(chat, msg_id, "要先登入你的帳號才能用你的身分傳。打 /setup 按「大檔案（登入帳號）」。")
+    save_env(UPLOAD_AS_USER=mode)
+    edit(chat, msg_id, f"✅ 上傳身分：{UPLOAD_MODES[mode]}（上限 {MAX_UPLOAD_MB}MB）")
 
 
 def setup_keyboard():
     return json.dumps({"inline_keyboard": [
         [{"text": "📥 傳回這裡", "callback_data": "s|here"}, {"text": "👥 貼到群組", "callback_data": "s|group"}],
-        [{"text": "📦 大檔案（登入帳號）", "callback_data": "s|login"}]]})
+        [{"text": "📦 大檔案（登入帳號）", "callback_data": "s|login"},
+         {"text": "📤 上傳身分", "callback_data": "s|mode"}]]})
 
 
 def show_setup(chat):
@@ -1673,6 +1710,9 @@ def on_setup_button(choice, chat, msg_id):
                                   "3. 群組有開「話題」的話，到每個想用的子頻道裡各打一次 /setup，"
                                   "子頻道就會加進按鈕。名稱想自己取就打 /setup 名稱。\n"
                                   "想改回私訊，打 /setup 按「傳回這裡」。")
+    if choice == "mode":
+        return tg("editMessageText", {"chat_id": chat, "message_id": msg_id, "reply_markup": mode_keyboard(),
+                                      "text": "下載結果要用誰的身分傳？用你的帳號傳時，貼文會顯示是你發的。"})
     if choice == "login":
         if os.environ.get("TELEGRAM_API_ID") and os.environ.get("TELEGRAM_API_HASH"):
             setup_state[chat] = {"step": "phone"}
@@ -1740,8 +1780,10 @@ def setup_input(chat, text, msg):
 
 def login_done(chat, me):
     setup_state.pop(chat, None)
-    save_env(UPLOAD_AS_USER="1")
-    notify(chat, f"✅ 已登入 {me.first_name}，之後大檔案用你的帳號傳（上限 {MAX_UPLOAD_MB}MB）。")
+    if upload_mode() == "0":
+        save_env(UPLOAD_AS_USER="big")
+    notify(chat, f"✅ 已登入 {me.first_name}。上傳身分：{UPLOAD_MODES[upload_mode()]}（上限 {MAX_UPLOAD_MB}MB）。\n"
+                 "想改成全部用你的帳號，打 /setup 按「上傳身分」。")
 
 
 def cancel_setup(chat):
@@ -1807,6 +1849,8 @@ def on_callback(cb):
         return on_restart_button(data[2:], chat, msg.get("message_id"))
     if data.startswith("s|"):
         return on_setup_button(data[2:], chat, msg.get("message_id"))
+    if data.startswith("m|"):
+        return on_mode_button(data[2:], chat, msg.get("message_id"))
     if data.startswith("p|"):  # 不解這個要密碼的壓縮檔了
         if data[2:] not in waiting:
             return edit(chat, msg.get("message_id"), "這個壓縮檔已經不在等密碼了。")
