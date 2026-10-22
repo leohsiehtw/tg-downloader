@@ -1,7 +1,7 @@
 """
 工作列（右下角）圖示：在背景跑 bot.py，當掉 10 秒後自動重開。
 圖示顏色：綠＝執行中、黃＝重新啟動中、紅＝停住了（滑鼠移上去看原因）。
-右鍵選單可以看紀錄、開資料夾、重新啟動、結束。也可以私訊機器人 /restart 從手機重新啟動。
+右鍵選單可以看紀錄、開資料夾、重新啟動、切換開機自動執行、結束。也可以私訊機器人 /restart 從手機重新啟動。
 機器人停止、當掉、或上次電腦關機時，會寫進 bot.log，並用 Telegram 私訊通知你。
 """
 import os
@@ -22,6 +22,29 @@ HEARTBEAT = HERE / ".heartbeat"  # 執行中每分鐘更新；正常結束會刪
 NO_WINDOW = 0x08000000  # CREATE_NO_WINDOW：不跳黑色視窗
 COLORS = {"running": (46, 204, 113), "waiting": (241, 196, 15), "error": (231, 76, 60)}
 RESTART_CODE = 4  # bot.py 收到 /restart 時用這個代碼結束
+# 開機自動執行：在「啟動」資料夾放一個小 .vbs，叫 start-hidden.vbs 起來
+STARTUP = Path(os.environ.get("APPDATA", "")) / "Microsoft" / "Windows" / "Start Menu" / "Programs" / "Startup"
+STARTUP_FILES = [STARTUP / "tg-downloader.vbs", STARTUP / "tg-downloader.lnk"]  # .lnk 是舊版手動建的捷徑
+
+
+def autostart_on():
+    return any(p.exists() for p in STARTUP_FILES)
+
+
+def set_autostart(on):
+    if on:
+        target = str(HERE / "start-hidden.vbs").replace('"', '""')
+        STARTUP.mkdir(parents=True, exist_ok=True)
+        # UTF-16 才能放中文路徑
+        STARTUP_FILES[0].write_text(f'CreateObject("WScript.Shell").Run "wscript ""{target}""", 0, False\r\n',
+                                    encoding="utf-16")
+    else:
+        for p in STARTUP_FILES:
+            try:
+                p.unlink()
+            except FileNotFoundError:
+                pass
+
 LOG_KEEP_DAYS = 2  # bot.log 每幾天清一次
 LOG_CLEARED = HERE / ".log-cleared"  # 上次清 bot.log 的時間
 _log_lock = threading.Lock()
@@ -231,6 +254,8 @@ def main():
         pystray.MenuItem("看紀錄", lambda *_: os.startfile(LOG), default=True),
         pystray.MenuItem("開啟資料夾", lambda *_: os.startfile(HERE)),
         pystray.MenuItem("重新啟動", lambda *_: runner.restart()),
+        pystray.MenuItem("開機自動執行", lambda *_: set_autostart(not autostart_on()),
+                         checked=lambda item: autostart_on()),
         pystray.MenuItem("結束", on_quit),
     )
 
