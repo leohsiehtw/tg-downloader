@@ -9,6 +9,7 @@ import asyncio
 import json
 import mimetypes
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -24,6 +25,12 @@ SESSION = str(HERE / "user")
 VIDEO_EXT = {".mp4", ".mov", ".m4v", ".webm", ".mkv"}
 IMAGE_EXT = {".jpg", ".jpeg", ".png", ".webp"}
 PHOTO_MAX_BYTES = 10 * 1024 * 1024  # 超過就不能當照片傳，改用檔案
+
+
+def _same_name(a, b):
+    """檔名一樣；bot.py 存檔時把 Windows 不能用的字元換成 _，比對時兩邊都換過再比。"""
+    clean = lambda n: re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", n or "").strip(" .")
+    return a == b or clean(a) == clean(b)
 
 
 def _client():
@@ -175,8 +182,11 @@ class Uploader:
 
     async def _find(self, bot, name, size, origin):
         """機器人收到的檔案，在你跟機器人的對話裡用大小和檔名找回同一則；找不到再去原本的頻道找。"""
-        async for m in self.client.iter_messages(bot, limit=300):
-            if m.file and m.file.size == size and (not name or m.file.name == name):
+        if not size and not name:
+            return None
+        # 只知道檔名（重啟前失敗、沒記到大小的）就往回多找一點
+        async for m in self.client.iter_messages(bot, limit=300 if size else 2000):
+            if m.file and (not size or m.file.size == size) and (not name or _same_name(m.file.name, name)):
                 return m
         if origin:
             try:
@@ -190,7 +200,7 @@ class Uploader:
     async def _download(self, bot, name, size, origin, dest, progress):
         m = await self._find(bot, name, size, origin)
         if m is None:
-            raise RuntimeError(f"用你的帳號找不到 {name}（在跟機器人的對話裡沒找到同樣大小的檔案）")
+            raise RuntimeError(f"用你的帳號找不到 {name}（在跟機器人的對話裡沒找到這個檔案）")
         await self.client.download_media(m, file=str(dest), progress_callback=progress)
 
     def download(self, bot, name, size, dest, origin=None, progress=None):

@@ -27,3 +27,5 @@ __pycache__/
 .passwords.json
 .restart
 README-個人.md
+.failed.json
+.failed.tmp

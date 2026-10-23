@@ -187,7 +187,48 @@ def tg(method, data=None, files=None, timeout=300):
         raise RuntimeError(f"{method} 失敗：{body.get('description')}")
 
 
-failures = {}  # 失敗訊息上「重試」按鈕對應的工作：key → (網址或壓縮檔, 子頻道 id, 原訊息 id)
+# 失敗、還沒重試的工作：key → 記錄（存在 .failed.json，重啟後重試按鈕照樣能用，啟動時也會問要不要全部重試）
+FAILED_FILE = Path(__file__).with_name(".failed.json")
+_failed_lock = threading.Lock()
+
+
+def load_failures():
+    try:
+        return json.loads(FAILED_FILE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+failures = load_failures()
+
+
+def save_failures():
+    with _failed_lock:
+        try:
+            tmp = FAILED_FILE.with_suffix(".tmp")
+            tmp.write_text(json.dumps(failures, ensure_ascii=False), encoding="utf-8")
+            tmp.replace(FAILED_FILE)
+        except OSError as e:
+            log.warning("存失敗清單失敗：%s", e)
+
+
+def failure_record(what, thread_id, src):
+    if isinstance(what, ArchiveJob):
+        return {"kind": "archive", "name": what.name, "caption": what.caption, "parts": what.parts,
+                "thread": thread_id, "src": src}
+    return {"kind": "url", "url": what, "thread": thread_id, "src": src}
+
+
+def from_record(rec):
+    """記錄 → (網址或壓縮檔, 子頻道 id, 原訊息 id)。壓縮檔從頭來：重新下載、重新試密碼。"""
+    if rec["kind"] == "archive":
+        job = ArchiveJob(rec["parts"], rec["name"], rec.get("caption", ""))
+        job.src = rec.get("src")
+        what = job
+    else:
+        what = rec["url"]
+    thread_id = rec.get("thread")
+    return what, default_topic() if thread_id is None else thread_id, rec.get("src")
 
 
 def notify_failed(chat_id, text):
@@ -200,9 +241,10 @@ def notify_failed(chat_id, text):
         data["reply_parameters"] = json.dumps({"message_id": src, "allow_sending_without_reply": True})
     if isinstance(what, (str, ArchiveJob)):
         key = f"{int(time.time() * 1000) % 10**9}-{len(failures)}"
-        failures[key] = (what, thread_id, src)
+        failures[key] = failure_record(what, thread_id, src)
         while len(failures) > 200:  # 太舊的就不留了
             failures.pop(next(iter(failures)))
+        save_failures()
         where = topic_name(thread_id)
         rows = [[{"text": "🔁 重試" + (f"（{where}）" if where else ""), "callback_data": f"x|{key}|again"}]]
         if TOPICS:
@@ -1256,7 +1298,8 @@ class ArchiveJob:
     @property
     def label(self):
         more = f"，{len(self.parts)} 個分卷" if len(self.parts) > 1 else ""
-        return f"🗜 {self.name}（{human(self.size)}{more}）"
+        info = (human(self.size) if self.size else "") + more
+        return f"🗜 {self.name}" + (f"（{info.lstrip('，')}）" if info else "")
 
 
 def is_archive(name):
@@ -1336,15 +1379,19 @@ def fetch_parts(job):
     for i, part in enumerate(job.parts, 1):
         dest = job.folder / part["name"]
         report = download_meter(part["name"], i, len(job.parts), before, total)
-        if UPLOAD_AS_USER and (not ONLY_BIG_AS_USER or part["size"] > BOT_API_FILE_MAX):
+        # 只知道檔名的（大小 0、沒有 file_id）只能用你的帳號在聊天裡找
+        if UPLOAD_AS_USER and (not ONLY_BIG_AS_USER or part["size"] > BOT_API_FILE_MAX or not part.get("file_id")):
             user_uploader().download(BOT_USERNAME, part["orig_name"], part["size"], dest,
                                      part["origin"], report)
         else:
             bot_download(part, dest, report)
+        part["size"] = part["size"] or dest.stat().st_size
         before += part["size"]
 
 
 def bot_download(part, dest, report):
+    if not part.get("file_id"):
+        raise RuntimeError("找不到這個檔案的記錄，請重新轉傳一次")
     if part["size"] > BOT_API_FILE_MAX and not LOCAL_BOT_API:
         raise RuntimeError("機器人自己只能下載 20MB 以下的檔案；大檔要先在 /setup 登入你的帳號")
     path = tg("getFile", {"file_id": part["file_id"]})["file_path"]
@@ -2077,17 +2124,61 @@ def on_callback(cb):
 def on_retry_button(data, chat, msg_id):
     """失敗訊息的「重試」：照原本的子頻道再做一次，或先重選子頻道。壓縮檔用原本的檔案重新下載，不用再轉傳。"""
     _, key, how = data.split("|", 2)
-    job = failures.pop(key, None)
-    if job is None:
-        return edit(chat, msg_id, "這個重試按鈕過期了（機器人重啟過），請重傳連結或檔案。")
-    what, thread_id, src = job
-    if isinstance(what, ArchiveJob):  # 從頭來：重新下載、重新試密碼
-        what.folder, what.password, what.wrong = None, None, []
+    if key == "all":
+        return retry_all(how, chat, msg_id)
+    rec = failures.pop(key, None)
+    if rec is None:
+        return edit(chat, msg_id, "這個已經重試過或清掉了。")
+    save_failures()
+    what, thread_id, src = from_record(rec)
     if how == "pick":
         edit(chat, msg_id, f"🔁 重試：{job_label(what)}")
         return ask_topic(chat, what, f"🔁 重試：{job_label(what)}", src)
     edit(chat, msg_id, f"🔁 重試：{job_label(what)}" + (f" → {topic_name(thread_id)}" if topic_name(thread_id) else ""))
     enqueue(what, chat, thread_id, src=src)
+
+
+def retry_all(how, chat, msg_id):
+    """啟動時那則「還有 N 個失敗」的按鈕：全部照原本的子頻道重試、先選一個子頻道全部貼那裡、或清掉。"""
+    if how == "clear":
+        n = len(failures)
+        failures.clear()
+        save_failures()
+        return edit(chat, msg_id, f"🗑 清掉了 {n} 個失敗的工作。")
+    if how == "pick":
+        return tg("editMessageText", {
+            "chat_id": chat, "message_id": msg_id, "text": f"🔁 {len(failures)} 個失敗的要全部貼到哪個子頻道？",
+            "reply_markup": json.dumps({"inline_keyboard": [
+                [{"text": n, "callback_data": f"x|all|to:{n}"} for n in list(TOPICS)[i:i + 3]]
+                for i in range(0, len(TOPICS), 3)]})})
+    to = None
+    if how.startswith("to:"):
+        if how[3:] not in TOPICS:
+            return edit(chat, msg_id, "這個子頻道已經不在設定裡了，請再打一次 /retry。")
+        to = TOPICS[how[3:]]
+    todo = list(failures.values())
+    failures.clear()
+    save_failures()
+    for rec in todo:
+        what, thread_id, src = from_record(rec)
+        enqueue(what, chat, thread_id if to is None else to, src=src)
+    edit(chat, msg_id, f"🔁 {len(todo)} 個失敗的排進去重試了" + (f" → {topic_name(to)}" if to is not None else "")
+         + "。會照順序做，被限流會自動等。")
+
+
+def ask_retry_all(chat):
+    """還有失敗沒重試的：問要不要全部重試（啟動時和 /retry）。"""
+    if not failures:
+        return notify(chat, "沒有失敗待重試的工作。")
+    names = [rec["name"] if rec["kind"] == "archive" else rec["url"] for rec in failures.values()]
+    rows = [[{"text": f"🔁 全部重試（{len(names)} 個）", "callback_data": "x|all|again"}]]
+    if TOPICS:
+        rows[0].append({"text": "🔁 選子頻道全部重試", "callback_data": "x|all|pick"})
+    rows.append([{"text": "🗑 清掉", "callback_data": "x|all|clear"}])
+    tg("sendMessage", {"chat_id": chat, "disable_web_page_preview": True,
+                       "text": f"⚠️ 還有 {len(names)} 個失敗沒重試：\n" + "\n".join(f"• {n}" for n in names[:30])
+                               + (f"\n…等 {len(names)} 個" if len(names) > 30 else ""),
+                       "reply_markup": json.dumps({"inline_keyboard": rows})})
 
 
 def answer(cb, text=None):
@@ -2146,6 +2237,8 @@ def on_message(msg):
         return live_status(chat["id"])
     if cmd == "/restart":
         return ask_restart(chat["id"])
+    if cmd == "/retry":
+        return ask_retry_all(chat["id"])
     doc = msg.get("document")
     if doc and is_archive(doc.get("file_name")):  # 先看檔案：轉傳的說明裡常有別的連結
         return collect_archive(chat["id"], msg, doc)
@@ -2240,6 +2333,7 @@ def main():
         tg("setMyCommands", {"commands": json.dumps([
             {"command": "status", "description": "看進度和電腦狀態（CPU、RAM、GPU）"},
             {"command": "setup", "description": "設定：傳到哪裡、群組子頻道、大檔案"},
+            {"command": "retry", "description": "重試之前失敗的"},
             {"command": "restart", "description": "重新啟動機器人"}])})
     except Exception as e:
         log.warning("設定指令選單失敗：%s", e)
@@ -2264,6 +2358,11 @@ def main():
         notify(next(iter(ALLOWED_USER_IDS)), "✅ 機器人已啟動。" + news)
     if UPLOAD_AS_USER:
         log.info("用你的帳號上傳，上限 %dMB", MAX_UPLOAD_MB)
+    if failures and ALLOWED_USER_IDS:  # 上次還有失敗沒重試
+        try:
+            ask_retry_all(restarted or next(iter(ALLOWED_USER_IDS)))
+        except Exception as e:
+            log.warning("問要不要重試失敗：%s", e)
     COOKIE_DIR.mkdir(exist_ok=True)
     if not TOTALS_FILE.exists():
         count()  # 從今天開始算累計
