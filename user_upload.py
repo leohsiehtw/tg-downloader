@@ -16,6 +16,7 @@ import threading
 from pathlib import Path
 
 from telethon import TelegramClient
+from telethon.errors import FloodWaitError
 from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeVideo, InputMediaUploadedDocument
 
 HERE = Path(__file__).resolve().parent
@@ -59,6 +60,7 @@ class Uploader:
 
     def __init__(self):
         self.entities = {}  # 貼過的對象（群組 id、機器人 username）
+        self.on_wait = lambda seconds: None  # Telegram 限流要等時，告訴 bot.py 等多久
         self.loop = asyncio.new_event_loop()
         threading.Thread(target=self.loop.run_forever, daemon=True).start()
         self._run(self._start())
@@ -90,6 +92,17 @@ class Uploader:
         finally:
             self.loop.call_soon_threadsafe(self.loop.stop)
 
+    async def _patient(self, make):
+        """Telegram 限流（FloodWait，傳太多照片時常要等十幾二十分鐘）：照它說的秒數等完再重做，不要直接失敗。
+        相簿要整組上傳完才會貼出，所以重做不會重複貼。"""
+        while True:
+            try:
+                return await make()
+            except FloodWaitError as e:
+                self.on_wait(e.seconds)
+                await asyncio.sleep(e.seconds + 2)
+                self.on_wait(0)
+
     def _tick(self, p: Path, sent=0):
         """回報整批的上傳進度（給 bot.py 顯示在 Telegram 私訊裡）。"""
         try:
@@ -103,7 +116,8 @@ class Uploader:
             return str(p)
         dur, w, h = _probe(p)
         t = _thumb(p, tmp)
-        file = await self.client.upload_file(str(p), progress_callback=lambda s, _: self._tick(p, s))
+        file = await self._patient(lambda: self.client.upload_file(
+            str(p), progress_callback=lambda s, _: self._tick(p, s)))
         self.done += p.stat().st_size
         return InputMediaUploadedDocument(
             file=file,
@@ -127,25 +141,27 @@ class Uploader:
                 group = album[i:i + 10]
                 batch = [await self._media(p, tmp) for p in group]
                 self._tick(group[-1])
-                r = await self.client.send_file(entity, batch if len(batch) > 1 else batch[0],
-                                                caption=(caption or None) if first else None,
-                                                reply_to=reply_to, supports_streaming=True)
+                r = await self._patient(lambda: self.client.send_file(
+                    entity, batch if len(batch) > 1 else batch[0], caption=(caption or None) if first else None,
+                    reply_to=reply_to, supports_streaming=True))
                 self.done += sum(p.stat().st_size for p in group if p.suffix.lower() not in VIDEO_EXT)
                 sent += len(r) if isinstance(r, list) else 1
                 first = False
         for p in others:  # gif、太大的圖片和其他檔案逐一送
-            await self.client.send_file(entity, str(p), caption=(caption or None) if first else None,
-                                        reply_to=reply_to, force_document=p.suffix.lower() in IMAGE_EXT,
-                                        progress_callback=lambda s, _, p=p: self._tick(p, s))
+            await self._patient(lambda p=p: self.client.send_file(
+                entity, str(p), caption=(caption or None) if first else None, reply_to=reply_to,
+                force_document=p.suffix.lower() in IMAGE_EXT, progress_callback=lambda s, _: self._tick(p, s)))
             self.done += p.stat().st_size
             sent += 1
             first = False
         return sent
 
-    def send(self, paths, caption, thread_id=0, progress=None, to=None):
+    def send(self, paths, caption, thread_id=0, progress=None, to=None, on_wait=None):
         """回傳 Telegram 確認收到的則數。progress(檔名, 第幾個, 共幾個, 已傳 bytes, 總 bytes) 用來顯示進度。
-        to：貼到哪，群組 id 或機器人的 username（就是貼到你跟機器人的聊天）。"""
+        to：貼到哪，群組 id 或機器人的 username（就是貼到你跟機器人的聊天）。
+        on_wait(秒數)：被 Telegram 限流、要停下來等時呼叫；等完會再呼叫一次 on_wait(0)。"""
         self.progress = progress or (lambda *a: None)
+        self.on_wait = on_wait or (lambda seconds: None)
         return self._run(self._send(list(paths), caption, thread_id, to))
 
     async def _find(self, bot, name, size, origin):

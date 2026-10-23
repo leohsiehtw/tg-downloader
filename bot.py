@@ -138,10 +138,11 @@ def place(tid):
     return topic_name(tid) or ("頻道" if CHANNEL_ID else "這個聊天")
 
 
-def enqueue(what, chat, thread_id, msg_id=None):
+def enqueue(what, chat, thread_id, msg_id=None, src=None):
+    """src：你傳的那則連結或檔案訊息，失敗時回覆它。"""
     with _count_lock:
         _count["outstanding"] += 1
-    jobs.put((what, chat, thread_id, msg_id))
+    jobs.put((what, chat, thread_id, msg_id, src))
 
 
 def idle():
@@ -182,6 +183,33 @@ def tg(method, data=None, files=None, timeout=300):
             time.sleep(wait)  # 訊息送太快被 Telegram 限流，等它說的秒數再送
             continue
         raise RuntimeError(f"{method} 失敗：{body.get('description')}")
+
+
+failures = {}  # 失敗訊息上「重試」按鈕對應的工作：key → (網址或壓縮檔, 子頻道 id, 原訊息 id)
+
+
+def notify_failed(chat_id, text):
+    """失敗訊息：回覆你當初傳的連結或檔案，附「重試」按鈕（重試時可以重選子頻道）。上傳資料夾的檔案沒有重試。"""
+    if chat_id is None:
+        return
+    what, thread_id, src = getattr(_local, "job", None) or (None, 0, None)
+    data = {"chat_id": chat_id, "text": text, "disable_web_page_preview": True}
+    if src:
+        data["reply_parameters"] = json.dumps({"message_id": src, "allow_sending_without_reply": True})
+    if isinstance(what, (str, ArchiveJob)):
+        key = f"{int(time.time() * 1000) % 10**9}-{len(failures)}"
+        failures[key] = (what, thread_id, src)
+        while len(failures) > 200:  # 太舊的就不留了
+            failures.pop(next(iter(failures)))
+        where = topic_name(thread_id)
+        rows = [[{"text": "🔁 重試" + (f"（{where}）" if where else ""), "callback_data": f"x|{key}|again"}]]
+        if TOPICS:
+            rows[0].append({"text": "🔁 換子頻道重試", "callback_data": f"x|{key}|pick"})
+        data["reply_markup"] = json.dumps({"inline_keyboard": rows})
+    try:
+        tg("sendMessage", data)
+    except Exception as e:
+        log.warning("通知失敗：%s", e)
 
 
 def notify(chat_id, text):
@@ -290,6 +318,21 @@ def upload_meter():
         left = (total - done) / speed if speed else 0
         status(f"⬆️ 上傳中 {idx}/{count}：{name}\n{bar(frac)} {frac:.0%}（{human(done)} / {human(total)}）\n"
                f"{human(speed)}/s，約剩 {duration_text(left)}", progress)
+    return report
+
+
+def flood_notice():
+    """你的帳號被 Telegram 限流時，進度訊息改成顯示要等多久（等完自動繼續，排在後面的也會跟著等）。"""
+    progress = getattr(_local, "progress", None)
+
+    def report(seconds):
+        if seconds:
+            until = time.strftime("%H:%M", time.localtime(time.time() + seconds))
+            status(f"⏸ Telegram 說傳太多了，要等 {duration_text(seconds)}（約 {until}）\n等完會自動繼續上傳，不用重傳。",
+                   progress)
+            log.warning("Telegram 限流，等 %d 秒", seconds)
+        else:
+            status("⬆️ 限流結束，繼續上傳…", progress)
     return report
 
 
@@ -981,7 +1024,8 @@ def upload(files, caption, thread_id, chat=None):
             sent += send_files(by_bot, caption=caption, thread_id=thread_id, chat=chat)
         if by_user:
             sent += user_uploader().send(by_user, caption="" if by_bot else caption, thread_id=thread_id,
-                                         progress=upload_meter(), to=CHANNEL_ID or BOT_USERNAME)
+                                         progress=upload_meter(), to=CHANNEL_ID or BOT_USERNAME,
+                                         on_wait=flood_notice())
         if sent != len(ok):
             raise RuntimeError(f"只確認到 {sent}/{len(ok)} 個檔案上傳成功")
         count(files=len(ok), bytes=total_size(ok))
@@ -999,7 +1043,7 @@ def handle(url, reply_chat, thread_id=0):
     def failed(e):
         log.exception("處理失敗 %s", url)
         count(failed=1)
-        notify(reply_chat, f"❌ 失敗：{url}\n{str(e)[:500]}")
+        notify_failed(reply_chat, f"❌ 失敗：{url}\n{str(e)[:500]}")
 
     try:
         files = download(url, folder)
@@ -1106,7 +1150,8 @@ def send_folder(sendable, paths, names, tmp, failed, reply_chat, thread_id):
 # ---------------- 壓縮檔（轉傳給機器人的 zip / 7z / rar） ----------------
 
 ARCHIVE_RE = re.compile(r"\.(zip|7z|rar|z\d\d|r\d\d|\d{3})$", re.I)
-PARTS_WAIT = 6  # 收到壓縮檔後等幾秒，同一組的分卷一起轉傳時會陸續進來
+PARTS_WAIT = 2  # 收到分卷後等幾秒，同一組的其他分卷一起轉傳時會陸續進來（單一壓縮檔不用等）
+VOLUME_RE = re.compile(r"\.(part\d+\.rar|z\d\d|r\d\d|\d{3})$", re.I)  # 檔名看得出是分卷
 PASSWORD_WAIT = 24 * 3600  # 等你給密碼最多等多久，過了就把下載的檔案刪掉
 PASSWORDS_FILE = Path(__file__).with_name(".passwords.json")  # 解開過的密碼，下次先試
 BOT_API_FILE_MAX = 20 * 1024 * 1024  # 機器人自己（Bot API）只能下載 20MB 以下的檔案
@@ -1129,6 +1174,7 @@ class ArchiveJob:
         self.folder = None
         self.password = None  # 你傳來的密碼；None＝還沒給，先自己猜
         self.wrong = []  # 你給過但不對的密碼
+        self.src = None  # 你轉傳的第一個檔案的訊息 id（失敗時回覆它）
 
     @property
     def size(self):
@@ -1280,7 +1326,7 @@ def handle_archive(job, reply_chat, thread_id=0):
     def failed(e):
         log.exception("壓縮檔處理失敗 %s", job.name)
         count(failed=1)
-        notify(reply_chat, f"❌ 失敗：{job.name}\n{str(e)[:500]}")
+        notify_failed(reply_chat, f"❌ 失敗：{job.name}\n{str(e)[:500]}")
         shutil.rmtree(job.folder, ignore_errors=True)
 
     try:
@@ -1374,12 +1420,12 @@ def take_password(chat, text, msg):
     job = w["job"]
     job.password = text
     edit(chat, w["msg"], f"🔑 收到 {job.name} 的密碼，解壓中…")
-    enqueue(job, chat, w["thread"], w["msg"])
+    enqueue(job, chat, w["thread"], w["msg"], job.src)
     return True
 
 
 def collect_archive(chat, msg, doc):
-    """收到壓縮檔先等幾秒，同一組的其他分卷也到了再一起處理。"""
+    """單一壓縮檔馬上處理；分卷先等幾秒，同一組的其他分卷也到了再一起處理。"""
     name = safe_name(doc.get("file_name") or f"{doc['file_unique_id']}.zip")
     origin = msg.get("forward_origin") or {}
     part = {"file_id": doc["file_id"], "name": name, "orig_name": doc.get("file_name") or "",
@@ -1387,7 +1433,7 @@ def collect_archive(chat, msg, doc):
             "origin": (origin["chat"]["id"], origin["message_id"]) if origin.get("type") == "channel" else None}
     key = (chat, archive_key(name))
     with _parts_lock:
-        group = _parts.setdefault(key, {"parts": {}, "text": ""})
+        group = _parts.setdefault(key, {"parts": {}, "text": "", "src": msg.get("message_id")})
         group["parts"][name] = part  # 同一個檔案轉傳兩次只算一次
         group["text"] += " " + (msg.get("caption") or "")
         tid = None if msg.get("forward_origin") else find_topic(msg.get("caption") or "")
@@ -1395,8 +1441,11 @@ def collect_archive(chat, msg, doc):
             _topic_hint[chat] = (tid, time.time())
         if group.get("timer"):
             group["timer"].cancel()
-        group["timer"] = threading.Timer(PARTS_WAIT, archive_ready, (key,))
-        group["timer"].start()
+        if VOLUME_RE.search(name):
+            group["timer"] = threading.Timer(PARTS_WAIT, archive_ready, (key,))
+            group["timer"].start()
+            return
+    archive_ready(key)  # 不是分卷就馬上問要貼到哪
 
 
 def archive_ready(key):
@@ -1407,13 +1456,14 @@ def archive_ready(key):
     chat, name = key
     parts = sorted(group["parts"].values(), key=lambda p: natural(p["name"]))
     job = ArchiveJob(parts, name, group["text"].strip())
+    job.src = group["src"]
     hint, when = _topic_hint.pop(chat, (None, 0))
     tid = hint if time.time() - when < 120 else None  # 轉傳時另外打的子頻道名稱（兩分鐘內有效）
     if tid is None and TOPICS and not DEFAULT_TOPIC:
-        return ask_topic(chat, job, job.label)
+        return ask_topic(chat, job, job.label, job.src)
     tid = default_topic() if tid is None else tid
     note = wait_note()
-    enqueue(job, chat, tid)
+    enqueue(job, chat, tid, src=job.src)
     where = topic_name(tid)
     notify(chat, f"⏳ 收到 {job.label}" + (f" → {where}" if where else "") + (f"，{note}" if note else ""))
 
@@ -1445,13 +1495,13 @@ def in_use(p: Path):
         return True
 
 
-def ask_topic(chat, what, label):
+def ask_topic(chat, what, label, src=None):
     """私訊跳出子頻道按鈕；沒設子頻道或有 DEFAULT_TOPIC 就直接排進佇列。"""
     if not TOPICS or DEFAULT_TOPIC:
-        enqueue(what, chat, default_topic())
+        enqueue(what, chat, default_topic(), src=src)
         return
     key = f"{int(time.time() * 1000) % 10**9}-{len(pending)}"
-    pending[key] = what
+    pending[key] = (what, src)
     tg("sendMessage", {"chat_id": chat, "text": f"要貼到哪個子頻道？\n{label}",
                        "disable_web_page_preview": True, "reply_markup": topic_keyboard(key)})
 
@@ -1510,7 +1560,7 @@ def watch_folder():
 def download_worker():
     """下載（和轉檔）；好幾個一起跑。做完把上傳的部分排給 upload_worker。"""
     while True:
-        what, chat, thread_id, msg_id = jobs.get()
+        what, chat, thread_id, msg_id, src = jobs.get()
         label = job_label(what)
         where = topic_name(thread_id)
         progress = Progress(chat, f"⏳ {label}" + (f" → {where}" if where else ""), msg_id)
@@ -1518,6 +1568,7 @@ def download_worker():
         with _count_lock:
             _count["downloading"] += 1
         _local.progress = progress
+        _local.job = (what, thread_id, src)
         send = None
         try:
             if isinstance(what, ArchiveJob):
@@ -1530,19 +1581,20 @@ def download_worker():
             log.exception("處理失敗 %s", label)
         finally:
             _local.progress = None
+            _local.job = None
             with _count_lock:
                 _count["downloading"] -= 1
         if send is None:
             finish(progress)
         else:
             progress.text = "⬆️ 下載好了，等前面的上傳完…"
-            uploads.put((progress, send))
+            uploads.put((progress, send, (what, thread_id, src)))
 
 
 def upload_worker():
     """上傳一次一個。"""
     while True:
-        progress, send = uploads.get()
+        progress, send, _local.job = uploads.get()
         _local.progress = progress
         try:
             send()
@@ -1904,19 +1956,37 @@ def on_callback(cb):
         return on_setup_button(data[2:], chat, msg.get("message_id"))
     if data.startswith("m|"):
         return on_mode_button(data[2:], chat, msg.get("message_id"))
+    if data.startswith("x|"):
+        return on_retry_button(data, chat, msg.get("message_id"))
     if data.startswith("p|"):  # 不解這個要密碼的壓縮檔了
         if data[2:] not in waiting:
             return edit(chat, msg.get("message_id"), "這個壓縮檔已經不在等密碼了。")
         return give_up_password(data[2:], "🗑 不解了")
     _, key, name = data.split("|", 2)
-    url = pending.pop(key, None)
+    url, src = pending.pop(key, (None, None))
     if url is None or name not in TOPICS:
         answer(cb)
         return notify(chat, "這個按鈕過期了，請重傳連結或檔案。")
     answer(cb, f"→ {name}")
     # 馬上把按鈕換成「已選好」，輪到它時這則訊息會變成進度顯示
     edit(chat, msg["message_id"], f"⏳ {job_label(url)} → {name}\n{wait_note() or '準備中…'}")
-    enqueue(url, chat, TOPICS[name], msg["message_id"])
+    enqueue(url, chat, TOPICS[name], msg["message_id"], src)
+
+
+def on_retry_button(data, chat, msg_id):
+    """失敗訊息的「重試」：照原本的子頻道再做一次，或先重選子頻道。壓縮檔用原本的檔案重新下載，不用再轉傳。"""
+    _, key, how = data.split("|", 2)
+    job = failures.pop(key, None)
+    if job is None:
+        return edit(chat, msg_id, "這個重試按鈕過期了（機器人重啟過），請重傳連結或檔案。")
+    what, thread_id, src = job
+    if isinstance(what, ArchiveJob):  # 從頭來：重新下載、重新試密碼
+        what.folder, what.password, what.wrong = None, None, []
+    if how == "pick":
+        edit(chat, msg_id, f"🔁 重試：{job_label(what)}")
+        return ask_topic(chat, what, f"🔁 重試：{job_label(what)}", src)
+    edit(chat, msg_id, f"🔁 重試：{job_label(what)}" + (f" → {topic_name(thread_id)}" if topic_name(thread_id) else ""))
+    enqueue(what, chat, thread_id, src=src)
 
 
 def answer(cb, text=None):
@@ -2002,12 +2072,12 @@ def on_message(msg):
     tid = find_topic(text)
     if tid is None and TOPICS and not DEFAULT_TOPIC:
         for url in urls:
-            ask_topic(chat["id"], url, url)
+            ask_topic(chat["id"], url, url, msg.get("message_id"))
         return
     tid = default_topic() if tid is None else tid
     note = wait_note()
     for url in urls:
-        enqueue(url, chat["id"], tid)
+        enqueue(url, chat["id"], tid, src=msg.get("message_id"))
     where = topic_name(tid)
     notify(chat["id"], f"⏳ 收到 {len(urls)} 個連結" + (f" → {where}" if where else "")
            + (f"，{note}" if note else ""))
