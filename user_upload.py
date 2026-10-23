@@ -133,6 +133,7 @@ class Uploader:
                  or (p.suffix.lower() in IMAGE_EXT and p.stat().st_size <= PHOTO_MAX_BYTES)]
         others = [p for p in paths if p not in album]
         self.order, self.done, self.total = album + others, 0, sum(p.stat().st_size for p in paths)
+        self.first_id = None  # 這次貼出去的第一則（bot.py 要釘選用）
         first = True
         sent = 0
         with tempfile.TemporaryDirectory(prefix="tgthumb-") as tmp:
@@ -146,13 +147,15 @@ class Uploader:
                     reply_to=reply_to, supports_streaming=True))
                 self.done += sum(p.stat().st_size for p in group if p.suffix.lower() not in VIDEO_EXT)
                 sent += len(r) if isinstance(r, list) else 1
+                self.first_id = self.first_id or (r[0] if isinstance(r, list) else r).id
                 first = False
         for p in others:  # gif、太大的圖片和其他檔案逐一送
-            await self._patient(lambda p=p: self.client.send_file(
+            r = await self._patient(lambda p=p: self.client.send_file(
                 entity, str(p), caption=(caption or None) if first else None, reply_to=reply_to,
                 force_document=p.suffix.lower() in IMAGE_EXT, progress_callback=lambda s, _: self._tick(p, s)))
             self.done += p.stat().st_size
             sent += 1
+            self.first_id = self.first_id or r.id
             first = False
         return sent
 
@@ -163,6 +166,12 @@ class Uploader:
         self.progress = progress or (lambda *a: None)
         self.on_wait = on_wait or (lambda seconds: None)
         return self._run(self._send(list(paths), caption, thread_id, to))
+
+    def pin(self, to, msg_id):
+        """釘選你的帳號貼出去的訊息（不通知群組成員）。"""
+        async def run():
+            await self.client.pin_message(await self._entity(to), msg_id, notify=False)
+        self._run(run())
 
     async def _find(self, bot, name, size, origin):
         """機器人收到的檔案，在你跟機器人的對話裡用大小和檔名找回同一則；找不到再去原本的頻道找。"""

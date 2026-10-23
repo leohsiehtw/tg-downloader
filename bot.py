@@ -56,6 +56,8 @@ API_BASE = os.environ.get("TELEGRAM_API_BASE", "https://api.telegram.org").rstri
 # UPLOAD_AS_USER：0＝全部機器人傳；big＝50MB 以下機器人傳、超過才用你的帳號；1＝全部用你的帳號
 UPLOAD_AS_USER = os.environ.get("UPLOAD_AS_USER", "0") in ("1", "big")
 ONLY_BIG_AS_USER = os.environ.get("UPLOAD_AS_USER", "0") == "big"
+# 貼出去之後要不要釘選（never / ask / always），見 PIN_MODES
+PIN_MODE = os.environ.get("PIN_MODE", "never") if os.environ.get("PIN_MODE") in ("ask", "always") else "never"
 MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "2000" if UPLOAD_AS_USER else "50"))
 # 選用：IG / X 等需要登入的網站。匯出的 cookies 檔丟進 cookies 資料夾就好（檔名隨意），
 # 下載工具會依網址自己挑那個網站的 cookies。設了 COOKIES_FILE 就只用那個檔。
@@ -212,6 +214,47 @@ def notify_failed(chat_id, text):
         log.warning("通知失敗：%s", e)
 
 
+# 貼出去之後要不要釘選：never 不釘、ask 每次在進度訊息問、always 都釘。/setup 可以改
+PIN_MODES = {"never": "不要釘選", "ask": "每次問我", "always": "全部釘選"}
+pin_choice = {}  # 進度訊息 id → 你按了釘選（True）、不用（False），還沒回答是 None
+
+
+def pin_mode():
+    mode = os.environ.get("PIN_MODE", "never")
+    return mode if mode in PIN_MODES else "never"
+
+
+def pin_keyboard(msg_id):
+    return json.dumps({"inline_keyboard": [[{"text": "📌 貼好後釘選", "callback_data": f"n|{msg_id}|1"},
+                                            {"text": "不用釘選", "callback_data": f"n|{msg_id}|0"}]]})
+
+
+def on_pin_button(data, chat, cb):
+    _, msg_id, yes = data.split("|", 2)
+    msg_id = int(msg_id)
+    if msg_id not in pin_choice:
+        return answer(cb, "這個工作已經做完了")
+    pin_choice[msg_id] = yes == "1"
+    answer(cb, "📌 貼好後會釘選" if yes == "1" else "不釘選")
+    for p in list(active):  # 馬上把按鈕收掉
+        if p.msg_id == msg_id:
+            p.shown = None
+            p._flush()
+
+
+def pin_posted(posted, reply_chat):
+    """把這次貼出去的第一則釘選（相簿就是整組）。誰貼的就由誰釘：機器人要是管理員、有釘選權限。"""
+    who, dest, mid = posted
+    try:
+        if who == "user":
+            user_uploader().pin(dest, mid)
+        else:
+            tg("pinChatMessage", {"chat_id": dest, "message_id": mid, "disable_notification": True})
+    except Exception as e:
+        log.warning("釘選失敗：%s", e)
+        notify(reply_chat, f"📌 釘選失敗：{str(e)[:300]}\n（貼到群組時，機器人要是管理員、有「釘選訊息」權限）")
+
+
 def notify(chat_id, text):
     if chat_id is None:
         return
@@ -267,19 +310,34 @@ class Progress:
     def render(self):
         return f"{self.head}\n{self.text}"
 
+    def markup(self):
+        """「要不要釘選」還沒回答時，進度訊息下面一直掛著按鈕。"""
+        if PIN_MODE != "ask" or self.msg_id is None or pin_choice.get(self.msg_id) is not None:
+            return None
+        return pin_keyboard(self.msg_id)
+
     def _flush(self):
         with self.lock:
             text = self.render()
-            if self.stopped.is_set() or text == self.shown:
+            if self.msg_id is not None:
+                pin_choice.setdefault(self.msg_id, None)
+            markup = self.markup()
+            if self.stopped.is_set() or (text, markup) == self.shown:
                 return
             try:
                 if self.msg_id is None:
                     self.msg_id = tg("sendMessage", {"chat_id": self.chat, "text": text,
                                                      "disable_web_page_preview": True})["message_id"]
+                    pin_choice.setdefault(self.msg_id, None)
+                    markup = self.markup()
+                    if markup:
+                        tg("editMessageReplyMarkup", {"chat_id": self.chat, "message_id": self.msg_id,
+                                                      "reply_markup": markup})
                 else:
                     tg("editMessageText", {"chat_id": self.chat, "message_id": self.msg_id, "text": text,
-                                           "disable_web_page_preview": True})
-                self.shown = text
+                                           "disable_web_page_preview": True,
+                                           **({"reply_markup": markup} if markup else {})})
+                self.shown = (text, markup)
             except Exception as e:
                 log.debug("更新進度失敗：%s", e)
 
@@ -290,8 +348,12 @@ class Progress:
             if self.stopped.wait(LIVE_SECONDS * max(1, len(active))):
                 return
 
+    def wants_pin(self):
+        return PIN_MODE == "always" or (PIN_MODE == "ask" and pin_choice.get(self.msg_id) is True)
+
     def close(self):
         """工作結束：收掉進度訊息（結果另外發一則新訊息，手機才會跳通知）。"""
+        pin_choice.pop(self.msg_id, None)
         with self.lock:
             self.stopped.set()
             if self.msg_id is not None:
@@ -570,6 +632,12 @@ def target(thread_id, chat=None):
     return d
 
 
+def posted(where):
+    """記下這個工作貼出去的第一則（之後要釘選用）。"""
+    if getattr(_local, "posted", None) is None:
+        _local.posted = where
+
+
 def send_files(paths, caption, thread_id=0, chat=None):
     """照片/影片每 10 個一組用相簿送，其餘逐一送。回傳 Telegram 確認收到的則數。"""
     group = [p for p in paths if kind_of(p) in ("photo", "video")]
@@ -595,7 +663,9 @@ def send_files(paths, caption, thread_id=0, chat=None):
                 files[key] = open(p, "rb")
         status(f"⬆️ 上傳中（相簿 {i // 10 + 1}，{len(batch)} 個檔案）")
         try:
-            sent += len(tg("sendMediaGroup", {**target(thread_id, chat), "media": json.dumps(media)}, files or None))
+            r = tg("sendMediaGroup", {**target(thread_id, chat), "media": json.dumps(media)}, files or None)
+            sent += len(r)
+            posted(("bot", target(thread_id, chat)["chat_id"], r[0]["message_id"]))
         finally:
             for f in files.values():
                 f.close()
@@ -613,10 +683,11 @@ def send_files(paths, caption, thread_id=0, chat=None):
         status(f"⬆️ 上傳中：{p.name}")
         if LOCAL_BOT_API:
             data[k] = local_uri(p)
-            tg(method, data)
+            r = tg(method, data)
         else:
             with open(p, "rb") as f:
-                tg(method, data, {k: f})
+                r = tg(method, data, {k: f})
+        posted(("bot", data["chat_id"], r["message_id"]))
         sent += 1
         first = False
     return sent
@@ -1023,9 +1094,11 @@ def upload(files, caption, thread_id, chat=None):
         if by_bot:
             sent += send_files(by_bot, caption=caption, thread_id=thread_id, chat=chat)
         if by_user:
-            sent += user_uploader().send(by_user, caption="" if by_bot else caption, thread_id=thread_id,
-                                         progress=upload_meter(), to=CHANNEL_ID or BOT_USERNAME,
-                                         on_wait=flood_notice())
+            up = user_uploader()
+            sent += up.send(by_user, caption="" if by_bot else caption, thread_id=thread_id,
+                            progress=upload_meter(), to=CHANNEL_ID or BOT_USERNAME, on_wait=flood_notice())
+            if up.first_id:
+                posted(("user", CHANNEL_ID or BOT_USERNAME, up.first_id))
         if sent != len(ok):
             raise RuntimeError(f"只確認到 {sent}/{len(ok)} 個檔案上傳成功")
         count(files=len(ok), bytes=total_size(ok))
@@ -1596,8 +1669,11 @@ def upload_worker():
     while True:
         progress, send, _local.job = uploads.get()
         _local.progress = progress
+        _local.posted = None
         try:
             send()
+            if _local.posted and progress.wants_pin():
+                pin_posted(_local.posted, progress.chat)
         except Exception:
             log.exception("上傳失敗 %s", progress.head)
         finally:
@@ -1735,7 +1811,7 @@ setup_state = {}  # 私訊裡正在設定的人：chat id → {"step": ..., "log
 
 def apply_env():
     """照 os.environ 重新算一次會在聊天裡改的設定（不用重開）。"""
-    global CHANNEL_ID, TOPICS, UPLOAD_AS_USER, ONLY_BIG_AS_USER, MAX_UPLOAD_MB, MAX_BYTES
+    global CHANNEL_ID, TOPICS, UPLOAD_AS_USER, ONLY_BIG_AS_USER, MAX_UPLOAD_MB, MAX_BYTES, PIN_MODE
     CHANNEL_ID = os.environ.get("CHANNEL_ID", "").strip()
     TOPICS = _parse_topics(os.environ.get("TOPICS", "")) if CHANNEL_ID else {}
     ALLOWED_USER_IDS.clear()
@@ -1744,6 +1820,7 @@ def apply_env():
     ONLY_BIG_AS_USER = os.environ.get("UPLOAD_AS_USER", "0") == "big"
     MAX_UPLOAD_MB = int(os.environ.get("MAX_UPLOAD_MB", "2000" if UPLOAD_AS_USER else "50"))
     MAX_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+    PIN_MODE = pin_mode()
 
 
 def save_env(**kv):
@@ -1766,7 +1843,7 @@ def setup_text():
     where = "這個聊天（私訊）" if not CHANNEL_ID else f"群組 {CHANNEL_ID}"
     subs = "、".join(TOPICS) if TOPICS else "（沒有）"
     return (f"⚙️ 目前設定\n下載結果傳到：{where}\n子頻道：{subs}\n上傳身分：{UPLOAD_MODES[upload_mode()]}"
-            f"（上限 {MAX_UPLOAD_MB}MB）\n\n要改哪一項？")
+            f"（上限 {MAX_UPLOAD_MB}MB）\n釘選：{PIN_MODES[PIN_MODE]}\n\n要改哪一項？")
 
 
 UPLOAD_MODES = {"0": "全部機器人傳", "big": "50MB 以下機器人傳，大檔用你的帳號", "1": "全部用你的帳號"}
@@ -1800,7 +1877,14 @@ def setup_keyboard():
     return json.dumps({"inline_keyboard": [
         [{"text": "📥 傳回這裡", "callback_data": "s|here"}, {"text": "👥 貼到群組", "callback_data": "s|group"}],
         [{"text": "📦 大檔案（登入帳號）", "callback_data": "s|login"},
-         {"text": "📤 上傳身分", "callback_data": "s|mode"}]]})
+         {"text": "📤 上傳身分", "callback_data": "s|mode"}],
+        [{"text": "📌 釘選", "callback_data": "s|pin"}]]})
+
+
+def on_pin_mode_button(mode, chat, msg_id):
+    if mode in PIN_MODES:
+        save_env(PIN_MODE=mode)
+        edit(chat, msg_id, f"✅ 釘選：{PIN_MODES[mode]}")
 
 
 def show_setup(chat):
@@ -1820,6 +1904,13 @@ def on_setup_button(choice, chat, msg_id):
     if choice == "mode":
         return tg("editMessageText", {"chat_id": chat, "message_id": msg_id, "reply_markup": mode_keyboard(),
                                       "text": "下載結果要用誰的身分傳？用你的帳號傳時，貼文會顯示是你發的。"})
+    if choice == "pin":
+        return tg("editMessageText", {
+            "chat_id": chat, "message_id": msg_id,
+            "text": "下載的東西貼出去之後要不要釘選？選「每次問我」的話，選完子頻道會跳出「📌 貼好後釘選」按鈕。",
+            "reply_markup": json.dumps({"inline_keyboard": [
+                [{"text": ("✅ " if PIN_MODE == k else "") + v, "callback_data": f"pm|{k}"}]
+                for k, v in PIN_MODES.items()]})})
     if choice == "login":
         if os.environ.get("TELEGRAM_API_ID") and os.environ.get("TELEGRAM_API_HASH"):
             setup_state[chat] = {"step": "phone"}
@@ -1948,7 +2039,7 @@ def on_callback(cb):
     data = cb.get("data") or ""
     msg = cb.get("message") or {}
     chat = msg.get("chat", {}).get("id")
-    if not data.startswith("t|"):  # 子頻道按鈕在下面回，順便跳出選了哪裡
+    if not data.startswith(("t|", "n|")):  # 子頻道、釘選按鈕在下面回，順便跳出選了哪裡
         answer(cb)
     if data.startswith("r|"):
         return on_restart_button(data[2:], chat, msg.get("message_id"))
@@ -1958,6 +2049,10 @@ def on_callback(cb):
         return on_mode_button(data[2:], chat, msg.get("message_id"))
     if data.startswith("x|"):
         return on_retry_button(data, chat, msg.get("message_id"))
+    if data.startswith("n|"):
+        return on_pin_button(data, chat, cb)
+    if data.startswith("pm|"):
+        return on_pin_mode_button(data[3:], chat, msg.get("message_id"))
     if data.startswith("p|"):  # 不解這個要密碼的壓縮檔了
         if data[2:] not in waiting:
             return edit(chat, msg.get("message_id"), "這個壓縮檔已經不在等密碼了。")
@@ -1969,7 +2064,13 @@ def on_callback(cb):
         return notify(chat, "這個按鈕過期了，請重傳連結或檔案。")
     answer(cb, f"→ {name}")
     # 馬上把按鈕換成「已選好」，輪到它時這則訊息會變成進度顯示
-    edit(chat, msg["message_id"], f"⏳ {job_label(url)} → {name}\n{wait_note() or '準備中…'}")
+    text = f"⏳ {job_label(url)} → {name}\n{wait_note() or '準備中…'}"
+    if PIN_MODE == "ask":  # 選完子頻道順便問要不要釘選
+        pin_choice[msg["message_id"]] = None
+        tg("editMessageText", {"chat_id": chat, "message_id": msg["message_id"], "text": text,
+                               "disable_web_page_preview": True, "reply_markup": pin_keyboard(msg["message_id"])})
+    else:
+        edit(chat, msg["message_id"], text)
     enqueue(url, chat, TOPICS[name], msg["message_id"], src)
 
 
