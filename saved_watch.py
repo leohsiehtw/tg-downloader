@@ -91,7 +91,7 @@ def check(src, cookies, enqueue):
     if first:
         log.info("%s：第一次檢查，現有 %d 則記成看過，之後新收藏的才下載", SOURCES[src][0], len(items))
     for _, url in reversed(new):
-        enqueue(url, SOURCES[src][0])
+        enqueue(url, src)
     return len(new)
 
 
@@ -105,7 +105,7 @@ def forget(src):
 
 def run(enabled, cookies, enqueue, warn, minutes):
     """背景執行緒。enabled() 回傳現在開著的來源代號；cookies() 回傳 cookies 檔路徑；
-    enqueue(網址, 來源名稱) 排進下載；warn(文字) 通知主人；minutes() 回傳幾分鐘檢查一次。"""
+    enqueue(網址, 來源代號) 排進下載；warn(文字) 通知主人；minutes() 回傳幾分鐘檢查一次。"""
     broken = set()  # 已經通知過抓不到的來源，恢復前不再重複通知
     while True:
         for src in enabled():

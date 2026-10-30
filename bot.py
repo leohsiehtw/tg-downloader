@@ -2287,14 +2287,36 @@ def watch_minutes():
     return int(os.environ.get("WATCH_MINUTES", "20") or 20)
 
 
-def watch_enqueue(url, source):
-    """新收藏的排進下載；WATCH_TOPIC 有指定子頻道就直接貼那裡，沒有就跟一般連結一樣問。"""
+WATCH_TOPICS = {"ig": "IG", "x": "X"}  # 各來源貼到哪個子頻道，沒有就自動建
+_topic_lock = threading.Lock()
+
+
+def watch_topic(src):
+    """這個來源的子頻道 id；群組裡還沒有就建一個。沒設群組（傳回私訊）回傳 0。"""
+    if not CHANNEL_ID:
+        return 0
+    name = WATCH_TOPICS[src]
+    with _topic_lock:  # IG、X 同時有新的時不要建兩個
+        if name not in TOPICS:
+            tid = tg("createForumTopic", {"chat_id": CHANNEL_ID, "name": name})["message_thread_id"]
+            save_env(TOPICS=",".join(f"{n}:{i}" for n, i in {**TOPICS, name: tid}.items()))
+            log.info("建好子頻道 %s", name)
+        return TOPICS[name]
+
+
+def watch_enqueue(url, src):
+    """新收藏的排進下載，貼到這個來源的子頻道；建不了子頻道就跟一般連結一樣問你。"""
     owner = next(iter(ALLOWED_USER_IDS), None)
-    where = os.environ.get("WATCH_TOPIC", "")
-    if owner is None or where in TOPICS:
-        enqueue(url, owner, TOPICS.get(where, default_topic()))
-    else:
-        ask_topic(owner, url, f"🔖 {source}：{url}")
+    try:
+        tid = watch_topic(src)
+    except Exception as e:
+        log.warning("建子頻道 %s 失敗：%s", WATCH_TOPICS[src], e)
+        if owner is None:
+            return enqueue(url, None, default_topic())
+        notify(owner, f"❌ 建子頻道「{WATCH_TOPICS[src]}」失敗：{str(e)[:200]}\n"
+                      "我要是群組管理員、有「管理話題」權限，群組也要開「話題」。這則先問你要貼到哪。")
+        return ask_topic(owner, url, f"🔖 {saved_watch.SOURCES[src][0]}：{url}")
+    enqueue(url, owner, tid)
 
 
 def watch_warn(text):
@@ -2308,8 +2330,9 @@ def watch_text():
     lines = ["🔖 收藏 / 書籤後自動下載", f"每 {watch_minutes()} 分鐘看一次最新 {saved_watch.PEEK} 則，用 cookies 資料夾的登入。"]
     for k, (name, _) in saved_watch.SOURCES.items():
         lines.append(f"{name}：{'開' if k in on else '關'}")
-    if TOPICS:
-        lines.append(f"貼到：{os.environ.get('WATCH_TOPIC') or '每次問我'}")
+    if CHANNEL_ID:
+        lines.append("貼到：" + "、".join(f"{saved_watch.SOURCES[k][0]} → 子頻道「{n}」" for k, n in WATCH_TOPICS.items())
+                     + "（沒有會自動建）")
     lines.append("剛開啟時現有的收藏不會下載，之後新收藏的才會。")
     return "\n".join(lines)
 
@@ -2318,12 +2341,6 @@ def watch_keyboard():
     on = watching()
     rows = [[{"text": f"{'✅' if k in on else '⬜'} {name}", "callback_data": f"w|s|{k}"}
              for k, (name, _) in saved_watch.SOURCES.items()]]
-    if TOPICS:
-        cur = os.environ.get("WATCH_TOPIC", "")
-        names = ["每次問我"] + list(TOPICS)
-        rows += [[{"text": ("• " if (n == cur or (n == "每次問我" and not cur)) else "") + n,
-                   "callback_data": f"w|t|{'' if n == '每次問我' else n}"} for n in names[i:i + 3]]
-                 for i in range(0, len(names), 3)]
     return json.dumps({"inline_keyboard": rows})
 
 
@@ -2343,8 +2360,6 @@ def on_watch_button(data, chat, msg_id):
         save_env(WATCH_SAVED=",".join(on))
         if val in on:  # 馬上記下現有的收藏，不用等下一輪
             threading.Thread(target=watch_first, args=(val,), daemon=True).start()
-    elif kind == "t":
-        save_env(WATCH_TOPIC=val)
     tg("editMessageText", {"chat_id": chat, "message_id": msg_id, "text": watch_text(),
                            "reply_markup": watch_keyboard()})
 
