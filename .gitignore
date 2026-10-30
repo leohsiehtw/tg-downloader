@@ -29,3 +29,4 @@ __pycache__/
 README-個人.md
 .failed.json
 .failed.tmp
+.saved-seen.json

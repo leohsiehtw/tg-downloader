@@ -36,6 +36,8 @@ from urllib.parse import urlparse
 
 import requests
 
+import saved_watch
+
 # 讀同資料夾的 .env（不覆蓋已存在的環境變數）
 _env = Path(__file__).with_name(".env")
 if _env.exists():
@@ -2274,6 +2276,86 @@ def setup_group(msg, arg):
 
 # ---------------- 入口：Telegram 私訊機器人 ----------------
 
+# ---------------- 自動抓 IG 收藏、X 書籤 ----------------
+
+def watching():
+    """WATCH_SAVED=ig,x：現在開著的來源。"""
+    return [s for s in os.environ.get("WATCH_SAVED", "").split(",") if s in saved_watch.SOURCES]
+
+
+def watch_minutes():
+    return int(os.environ.get("WATCH_MINUTES", "20") or 20)
+
+
+def watch_enqueue(url, source):
+    """新收藏的排進下載；WATCH_TOPIC 有指定子頻道就直接貼那裡，沒有就跟一般連結一樣問。"""
+    owner = next(iter(ALLOWED_USER_IDS), None)
+    where = os.environ.get("WATCH_TOPIC", "")
+    if owner is None or where in TOPICS:
+        enqueue(url, owner, TOPICS.get(where, default_topic()))
+    else:
+        ask_topic(owner, url, f"🔖 {source}：{url}")
+
+
+def watch_warn(text):
+    owner = next(iter(ALLOWED_USER_IDS), None)
+    if owner is not None:
+        notify(owner, text)
+
+
+def watch_text():
+    on = watching()
+    lines = ["🔖 收藏 / 書籤後自動下載", f"每 {watch_minutes()} 分鐘看一次最新 {saved_watch.PEEK} 則，用 cookies 資料夾的登入。"]
+    for k, (name, _) in saved_watch.SOURCES.items():
+        lines.append(f"{name}：{'開' if k in on else '關'}")
+    if TOPICS:
+        lines.append(f"貼到：{os.environ.get('WATCH_TOPIC') or '每次問我'}")
+    lines.append("剛開啟時現有的收藏不會下載，之後新收藏的才會。")
+    return "\n".join(lines)
+
+
+def watch_keyboard():
+    on = watching()
+    rows = [[{"text": f"{'✅' if k in on else '⬜'} {name}", "callback_data": f"w|s|{k}"}
+             for k, (name, _) in saved_watch.SOURCES.items()]]
+    if TOPICS:
+        cur = os.environ.get("WATCH_TOPIC", "")
+        names = ["每次問我"] + list(TOPICS)
+        rows += [[{"text": ("• " if (n == cur or (n == "每次問我" and not cur)) else "") + n,
+                   "callback_data": f"w|t|{'' if n == '每次問我' else n}"} for n in names[i:i + 3]]
+                 for i in range(0, len(names), 3)]
+    return json.dumps({"inline_keyboard": rows})
+
+
+def show_watch(chat):
+    tg("sendMessage", {"chat_id": chat, "text": watch_text(), "reply_markup": watch_keyboard()})
+
+
+def on_watch_button(data, chat, msg_id):
+    kind, val = data.split("|", 1)
+    if kind == "s":
+        on = watching()
+        if val in on:
+            on.remove(val)
+            saved_watch.forget(val)
+        else:
+            on.append(val)
+        save_env(WATCH_SAVED=",".join(on))
+        if val in on:  # 馬上記下現有的收藏，不用等下一輪
+            threading.Thread(target=watch_first, args=(val,), daemon=True).start()
+    elif kind == "t":
+        save_env(WATCH_TOPIC=val)
+    tg("editMessageText", {"chat_id": chat, "message_id": msg_id, "text": watch_text(),
+                           "reply_markup": watch_keyboard()})
+
+
+def watch_first(src):
+    try:
+        saved_watch.check(src, cookie_file(), watch_enqueue)
+    except Exception as e:
+        watch_warn(f"⚠️ 抓不到{saved_watch.SOURCES[src][0]}，可能是 cookies 過期或沒放。\n{str(e)[:300]}")
+
+
 def topic_keyboard(key):
     names = list(TOPICS)
     rows = [names[i:i + 3] for i in range(0, len(names), 3)]
@@ -2302,6 +2384,8 @@ def on_callback(cb):
         return on_pin_button(data, chat, cb)
     if data.startswith("k|"):
         return on_cancel_button(data, chat, msg.get("message_id"), cb)
+    if data.startswith("w|"):
+        return on_watch_button(data[2:], chat, msg.get("message_id"))
     if data.startswith("pm|"):
         return on_pin_mode_button(data[3:], chat, msg.get("message_id"))
     if data.startswith("p|"):  # 不解這個要密碼的壓縮檔了
@@ -2448,6 +2532,8 @@ def on_message(msg):
         return ask_restart(chat["id"])
     if cmd == "/retry":
         return ask_retry_all(chat["id"])
+    if cmd == "/watch":
+        return show_watch(chat["id"])
     doc = msg.get("document")
     if doc and is_archive(doc.get("file_name")):  # 先看檔案：轉傳的說明裡常有別的連結
         return collect_archive(chat["id"], msg, doc)
@@ -2469,7 +2555,7 @@ def on_message(msg):
                 + ("貼到頻道。" if CHANNEL_ID else "傳回這裡。"))
         if TOPICS:
             hint += "\n連結前後加上子頻道名稱（" + "、".join(TOPICS) + "）就會直接貼到那裡。"
-        hint += "\n/status 看進度和電腦狀態，/cancel 取消下載或上傳，/setup 改設定，/restart 重新啟動。"
+        hint += "\n/status 看進度和電腦狀態，/cancel 取消下載或上傳，/watch 收藏後自動下載，/setup 改設定，/restart 重新啟動。"
         return notify(chat["id"], hint)
 
     tid = find_topic(text)
@@ -2560,6 +2646,7 @@ def main():
             {"command": "setup", "description": "設定：傳到哪裡、群組子頻道、大檔案"},
             {"command": "cancel", "description": "取消下載或上傳（排隊中、進行中都可以）"},
             {"command": "retry", "description": "重試之前失敗的"},
+            {"command": "watch", "description": "IG 收藏、X 書籤後自動下載"},
             {"command": "restart", "description": "重新啟動機器人"}])})
     except Exception as e:
         log.warning("設定指令選單失敗：%s", e)
@@ -2597,6 +2684,8 @@ def main():
         threading.Thread(target=download_worker, daemon=True).start()
     threading.Thread(target=upload_worker, daemon=True).start()
     threading.Thread(target=watch_folder, daemon=True).start()
+    threading.Thread(target=saved_watch.run, daemon=True,
+                     args=(watching, cookie_file, watch_enqueue, watch_warn, watch_minutes)).start()
     if ENABLE_POLLING:
         threading.Thread(target=poll, daemon=True).start()
     if SHARED_SECRET:
