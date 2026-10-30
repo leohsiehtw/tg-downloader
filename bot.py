@@ -17,6 +17,7 @@ TG Downloader：把網址裡的影片 / 圖片下載下來，貼到指定的 Tel
 """
 import collections
 import contextlib
+import itertools
 import json
 import logging
 import os
@@ -101,8 +102,8 @@ log = logging.getLogger("tg-downloader")
 
 # 下載可以好幾個同時跑；上傳一次一個（同時傳只會互搶頻寬，Telegram 也容易限流）
 DOWNLOAD_WORKERS = int(os.environ.get("DOWNLOAD_WORKERS", "3"))
-# 等下載的：(網址、檔案清單或壓縮檔, 通知對象, 子頻道 id, 拿來顯示進度的訊息 id)
-jobs: "queue.Queue[tuple[str | list | ArchiveJob, int | None, int, int | None]]" = queue.Queue()
+# 等下載的：(網址、檔案清單或壓縮檔, 通知對象, 子頻道 id, 拿來顯示進度的訊息 id, 原訊息 id, 工作 id)
+jobs: queue.Queue = queue.Queue()
 uploads: queue.Queue = queue.Queue()  # 下載好、等上傳的：(Progress, 上傳要做的事)
 pending: dict = {}  # 等你按按鈕選子頻道的網址、檔案清單或壓縮檔
 active = []  # 正在處理（下載中或等上傳、上傳中）的工作的 Progress
@@ -140,11 +141,69 @@ def place(tid):
     return topic_name(tid) or ("頻道" if CHANNEL_ID else "這個聊天")
 
 
+class Cancelled(Exception):
+    """你按了取消。"""
+
+
+class Ticket:
+    """排進佇列的一個工作。按「取消」時記下來，正在跑的下載、轉檔、解壓程式直接砍掉。"""
+
+    def __init__(self, label, chat, msg_id=None):
+        self.label, self.chat, self.msg_id = label, chat, msg_id  # msg_id：排隊中顯示它的訊息
+        self.progress = None  # 開始做了之後的進度訊息
+        self.event = threading.Event()
+        self.procs = set()
+
+    @property
+    def cancelled(self):
+        return self.event.is_set()
+
+    def cancel(self):
+        self.event.set()
+        for p in list(self.procs):
+            with contextlib.suppress(Exception):
+                p.kill()
+
+
+tickets = {}  # 工作 id → Ticket（排隊、下載、等上傳、上傳中都在這裡，做完才拿掉）
+_ticket_ids = itertools.count(1)
+
+
+def check_cancel():
+    """這個執行緒正在做的工作被取消了就停下來。"""
+    t = getattr(_local, "ticket", None)
+    if t is not None and t.cancelled:
+        raise Cancelled()
+
+
 def enqueue(what, chat, thread_id, msg_id=None, src=None):
-    """src：你傳的那則連結或檔案訊息，失敗時回覆它。"""
+    """src：你傳的那則連結或檔案訊息，失敗時回覆它。回傳工作 id（取消按鈕用）。"""
+    jid = str(next(_ticket_ids))
+    tickets[jid] = Ticket(job_label(what), chat, msg_id)
     with _count_lock:
         _count["outstanding"] += 1
-    jobs.put((what, chat, thread_id, msg_id, src))
+    jobs.put((what, chat, thread_id, msg_id, src, jid))
+    return jid
+
+
+def cancel_button(jids):
+    """取消按鈕；好幾個工作一起的話 callback_data 塞不下（上限 64 bytes）就不給。"""
+    data = "k|" + ",".join(jids)
+    return [{"text": "✖ 取消", "callback_data": data}] if len(data.encode()) <= 64 else []
+
+
+def notify_queued(chat, text, jids):
+    """「收到了、排進去了」的訊息，附取消按鈕。"""
+    if chat is None:
+        return
+    row = cancel_button(jids)
+    data = {"chat_id": chat, "text": text, "disable_web_page_preview": True}
+    if row:
+        data["reply_markup"] = json.dumps({"inline_keyboard": [row]})
+    try:
+        tg("sendMessage", data)
+    except Exception as e:
+        log.warning("通知失敗：%s", e)
 
 
 def idle():
@@ -266,9 +325,9 @@ def pin_mode():
     return mode if mode in PIN_MODES else "never"
 
 
-def pin_keyboard(msg_id):
-    return json.dumps({"inline_keyboard": [[{"text": "📌 貼好後釘選", "callback_data": f"n|{msg_id}|1"},
-                                            {"text": "不用釘選", "callback_data": f"n|{msg_id}|0"}]]})
+def pin_row(msg_id):
+    return [{"text": "📌 貼好後釘選", "callback_data": f"n|{msg_id}|1"},
+            {"text": "不用釘選", "callback_data": f"n|{msg_id}|0"}]
 
 
 def on_pin_button(data, chat, cb):
@@ -341,8 +400,8 @@ def duration_text(sec):
 class Progress:
     """私訊裡一則會自己更新的進度訊息；每 LIVE_SECONDS 秒改一次（太快會被 Telegram 限流）。"""
 
-    def __init__(self, chat, head, msg_id=None):
-        self.chat, self.head, self.msg_id = chat, head, msg_id
+    def __init__(self, chat, head, msg_id=None, jid=None):
+        self.chat, self.head, self.msg_id, self.jid = chat, head, msg_id, jid
         self.text, self.shown = "準備中…", None
         self.lock = threading.Lock()
         self.stopped = threading.Event()
@@ -353,10 +412,14 @@ class Progress:
         return f"{self.head}\n{self.text}"
 
     def markup(self):
-        """「要不要釘選」還沒回答時，進度訊息下面一直掛著按鈕。"""
-        if PIN_MODE != "ask" or self.msg_id is None or pin_choice.get(self.msg_id) is not None:
-            return None
-        return pin_keyboard(self.msg_id)
+        """進度訊息下面的按鈕：取消；「要不要釘選」還沒回答時也一直掛著。"""
+        rows = []
+        if PIN_MODE == "ask" and self.msg_id is not None and pin_choice.get(self.msg_id) is None:
+            rows.append(pin_row(self.msg_id))
+        t = tickets.get(self.jid)
+        if t is not None and not t.cancelled:
+            rows.append(cancel_button([self.jid]))
+        return json.dumps({"inline_keyboard": rows}) if rows else None
 
     def _flush(self):
         with self.lock:
@@ -444,7 +507,11 @@ def download_meter(name, idx, count, before, total):
     """下載轉傳來的檔案的進度；before＝前面幾個分卷已經下載的量，total＝全部分卷加起來。"""
     start, progress = time.time(), getattr(_local, "progress", None)
 
+    ticket = getattr(_local, "ticket", None)
+
     def report(done, _size=None):
+        if ticket is not None and ticket.cancelled:  # 用你的帳號下載時在別的執行緒呼叫，丟出去下載就會停
+            raise Cancelled()
         speed = done / max(time.time() - start, 0.1)
         frac = (before + done) / total if total else 1
         left = (total - before - done) / speed if speed else 0
@@ -692,6 +759,7 @@ def send_files(paths, caption, thread_id=0, chat=None):
         if len(batch) == 1:
             others.insert(0, batch[0])
             continue
+        check_cancel()
         media, files = [], {}
         for n, p in enumerate(batch):
             key = f"f{n}"
@@ -714,6 +782,7 @@ def send_files(paths, caption, thread_id=0, chat=None):
         first = False
 
     for p in others:
+        check_cancel()
         k = kind_of(p)
         method = {"photo": "sendPhoto", "video": "sendVideo",
                   "animation": "sendAnimation", "document": "sendDocument"}[k]
@@ -747,8 +816,14 @@ def local_uri(p: Path):
 
 def run_tool(cmd, on_line=None, timeout=3600):
     """跑外部程式，邊跑邊把每一行輸出交給 on_line 顯示進度；on_line 回傳 True 的行不算進錯誤訊息。"""
+    check_cancel()
+    ticket = getattr(_local, "ticket", None)
     p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                          text=True, encoding="utf-8", errors="replace")
+    if ticket is not None:  # 按取消時直接砍掉
+        ticket.procs.add(p)
+        if ticket.cancelled:
+            p.kill()
     timer = threading.Timer(timeout, p.kill)
     timer.start()
     tail = collections.deque(maxlen=20)
@@ -764,6 +839,9 @@ def run_tool(cmd, on_line=None, timeout=3600):
     finally:
         timer.cancel()
         p.wait()
+        if ticket is not None:
+            ticket.procs.discard(p)
+    check_cancel()
     return subprocess.CompletedProcess(cmd, p.returncode, "\n".join(tail), "")
 
 
@@ -894,7 +972,8 @@ def encode_turn(name):
     """轉檔、壓縮很吃 CPU 和顯卡，同時下載好幾個時也一次只做一支，其他的等。"""
     if not _encode_lock.acquire(blocking=False):
         status(f"🎞 等前一支轉檔完：{name}")
-        _encode_lock.acquire()
+        while not _encode_lock.acquire(timeout=1):
+            check_cancel()
     try:
         yield
     finally:
@@ -1054,6 +1133,8 @@ def download(url, folder: Path):
     for name, fn in (("gallery-dl", run_gallerydl), ("yt-dlp", run_ytdlp)):
         try:
             r = fn(url, folder)
+        except Cancelled:
+            raise
         except Exception as e:
             errors.append(f"{name}: {e}")
             continue
@@ -1128,6 +1209,7 @@ def upload(files, caption, thread_id, chat=None):
     limit = MAX_BYTES if as_user else BOT_MAX_BYTES
     too_big = [p for p in files if p.stat().st_size > limit]
     ok = [p for p in files if p not in too_big]
+    check_cancel()
     if ok:
         status(f"⬆️ 上傳中（{len(ok)} 個檔案，{human(sum(p.stat().st_size for p in ok))}）")
         by_user = [p for p in ok if as_user and (not ONLY_BIG_AS_USER or p.stat().st_size > BOT_MAX_BYTES)]
@@ -1137,8 +1219,14 @@ def upload(files, caption, thread_id, chat=None):
             sent += send_files(by_bot, caption=caption, thread_id=thread_id, chat=chat)
         if by_user:
             up = user_uploader()
-            sent += up.send(by_user, caption="" if by_bot else caption, thread_id=thread_id,
-                            progress=upload_meter(), to=CHANNEL_ID or BOT_USERNAME, on_wait=flood_notice())
+            ticket = getattr(_local, "ticket", None)
+            try:
+                sent += up.send(by_user, caption="" if by_bot else caption, thread_id=thread_id,
+                                progress=upload_meter(), to=CHANNEL_ID or BOT_USERNAME, on_wait=flood_notice(),
+                                stop=lambda: ticket is not None and ticket.cancelled)
+            except Exception:
+                check_cancel()  # 按了取消才停的就算取消，不算失敗
+                raise
             if up.first_id:
                 posted(("user", CHANNEL_ID or BOT_USERNAME, up.first_id))
         if sent != len(ok):
@@ -1156,6 +1244,8 @@ def handle(url, reply_chat, thread_id=0):
     folder = Path(tempfile.mkdtemp(prefix="tgdl-", dir=TEMP_DIR))
 
     def failed(e):
+        if isinstance(e, Cancelled):
+            return notify(reply_chat, f"🚫 已取消：{url}")
         log.exception("處理失敗 %s", url)
         count(failed=1)
         notify_failed(reply_chat, f"❌ 失敗：{url}\n{str(e)[:500]}")
@@ -1224,11 +1314,13 @@ def handle_files(paths, reply_chat, thread_id=0):
     tmp = Path(tempfile.mkdtemp(prefix="tgup-", dir=TEMP_DIR))
 
     def failed(e):
-        log.exception("資料夾上傳失敗 %s", names)
-        count(failed=1)
         for p in paths:
             if p.exists():
                 move_to(p, FAILED_DIR)
+        if isinstance(e, Cancelled):
+            return notify(reply_chat, f"🚫 已取消：{names}\n檔案移到「失敗」資料夾了，要傳再丟回上傳資料夾。")
+        log.exception("資料夾上傳失敗 %s", names)
+        count(failed=1)
         notify(reply_chat, f"❌ 資料夾上傳失敗：{names}\n{str(e)[:500]}\n檔案移到「失敗」資料夾了。")
 
     count(downloaded=total_size(paths))  # 資料夾裡的檔案算「處理」的量
@@ -1377,6 +1469,7 @@ def fetch_parts(job):
     """下載每個分卷：有開「用你的帳號」就用帳號下載（2GB 內都行），不然用機器人（只能 20MB 以下）。"""
     total, before = job.size, 0
     for i, part in enumerate(job.parts, 1):
+        check_cancel()
         dest = job.folder / part["name"]
         report = download_meter(part["name"], i, len(job.parts), before, total)
         # 只知道檔名的（大小 0、沒有 file_id）只能用你的帳號在聊天裡找
@@ -1404,6 +1497,7 @@ def bot_download(part, dest, report):
             r.raise_for_status()
             done = 0
             for chunk in r.iter_content(1 << 20):
+                check_cancel()
                 f.write(chunk)
                 done += len(chunk)
                 report(done)
@@ -1444,10 +1538,12 @@ def archive_media(out: Path):
 def handle_archive(job, reply_chat, thread_id=0):
     """下載壓縮檔、解壓（在下載執行緒）；回傳之後要在上傳執行緒做的事。要密碼時先私訊問你，回傳 None。"""
     def failed(e):
+        shutil.rmtree(job.folder, ignore_errors=True)
+        if isinstance(e, Cancelled):
+            return notify(reply_chat, f"🚫 已取消：{job.name}")
         log.exception("壓縮檔處理失敗 %s", job.name)
         count(failed=1)
         notify_failed(reply_chat, f"❌ 失敗：{job.name}\n{str(e)[:500]}")
-        shutil.rmtree(job.folder, ignore_errors=True)
 
     try:
         if job.folder is None:  # 第一次：先下載（等密碼回來時已經下載好了）
@@ -1583,9 +1679,10 @@ def archive_ready(key):
         return ask_topic(chat, job, job.label, job.src)
     tid = default_topic() if tid is None else tid
     note = wait_note()
-    enqueue(job, chat, tid, src=job.src)
+    jid = enqueue(job, chat, tid, src=job.src)
     where = topic_name(tid)
-    notify(chat, f"⏳ 收到 {job.label}" + (f" → {where}" if where else "") + (f"，{note}" if note else ""))
+    notify_queued(chat, f"⏳ 收到 {job.label}" + (f" → {where}" if where else "") + (f"，{note}" if note else ""),
+                  [jid])
 
 
 def job_label(what):
@@ -1680,15 +1777,22 @@ def watch_folder():
 def download_worker():
     """下載（和轉檔）；好幾個一起跑。做完把上傳的部分排給 upload_worker。"""
     while True:
-        what, chat, thread_id, msg_id, src = jobs.get()
+        what, chat, thread_id, msg_id, src, jid = jobs.get()
+        ticket = tickets.get(jid)
+        if ticket is None or ticket.cancelled:  # 還在排隊就被取消了
+            drop(what)
+            job_done(jid)
+            continue
         label = job_label(what)
         where = topic_name(thread_id)
-        progress = Progress(chat, f"⏳ {label}" + (f" → {where}" if where else ""), msg_id)
+        progress = Progress(chat, f"⏳ {label}" + (f" → {where}" if where else ""), msg_id, jid)
+        ticket.progress = progress
         active.append(progress)
         with _count_lock:
             _count["downloading"] += 1
         _local.progress = progress
         _local.job = (what, thread_id, src)
+        _local.ticket = ticket
         send = None
         try:
             if isinstance(what, ArchiveJob):
@@ -1702,6 +1806,7 @@ def download_worker():
         finally:
             _local.progress = None
             _local.job = None
+            _local.ticket = None
             with _count_lock:
                 _count["downloading"] -= 1
         if send is None:
@@ -1717,6 +1822,7 @@ def upload_worker():
         progress, send, _local.job = uploads.get()
         _local.progress = progress
         _local.posted = None
+        _local.ticket = tickets.get(progress.jid)
         try:
             send()
             if _local.posted and progress.wants_pin():
@@ -1725,6 +1831,7 @@ def upload_worker():
             log.exception("上傳失敗 %s", progress.head)
         finally:
             _local.progress = None
+            _local.ticket = None
             finish(progress)
 
 
@@ -1732,10 +1839,74 @@ def finish(progress):
     progress.close()
     if progress in active:
         active.remove(progress)
+    job_done(progress.jid)
+
+
+def job_done(jid):
+    tickets.pop(jid, None)
     with _count_lock:
         _count["outstanding"] -= 1
     if restart_when_idle is not None and idle():
         restart_now(restart_when_idle)
+
+
+def drop(what):
+    """排隊中就取消的工作：清掉已經下載的東西；上傳資料夾的檔案移到「失敗」，不然重啟前都不會再問。"""
+    if isinstance(what, ArchiveJob) and what.folder:
+        shutil.rmtree(what.folder, ignore_errors=True)
+    elif isinstance(what, list):
+        for p in what:
+            if p.exists():
+                move_to(p, FAILED_DIR)
+
+
+def cancel_jobs(jids):
+    """按了取消：排隊中的輪到時直接跳過，做到一半的砍掉正在跑的程式。回傳真的取消了幾個。"""
+    n = 0
+    for jid in jids:
+        t = tickets.get(jid)
+        if t is None or t.cancelled:
+            continue
+        t.cancel()
+        n += 1
+        if t.progress is not None:
+            status("🚫 取消中…", t.progress)
+            t.progress._flush()
+        elif t.msg_id is not None:
+            edit(t.chat, t.msg_id, f"🚫 已取消：{t.label}")
+    return n
+
+
+def on_cancel_button(data, chat, msg_id, cb):
+    """取消按鈕：進度訊息、「收到了」訊息、/cancel 清單上的都是這個。"""
+    which = data[2:]
+    if which == "all":
+        jids = [j for j, t in list(tickets.items()) if t.chat == chat]
+    else:
+        jids = which.split(",")
+    shown = {t.progress.msg_id if t.progress else t.msg_id for j in jids if (t := tickets.get(j))}
+    n = cancel_jobs(jids)
+    answer(cb, f"🚫 取消了 {n} 個" if n else "已經做完或取消了")
+    if n and msg_id not in shown:  # 按的是另外一則（「收到了」、/cancel 清單），把它改掉
+        edit(chat, msg_id, f"🚫 取消了 {n} 個工作。")
+
+
+def short(text, n=40):
+    return text if len(text) <= n else text[:n - 1] + "…"
+
+
+def ask_cancel(chat):
+    """/cancel：列出還在做和排隊的工作，按一下取消。"""
+    mine = [(j, t) for j, t in list(tickets.items()) if not t.cancelled]
+    if not mine:
+        return notify(chat, "現在沒有在做或排隊的工作。")
+    rows = [[{"text": f"✖ {'⚙️' if t.progress else '⏳'} {short(t.label.splitlines()[0])}",
+              "callback_data": f"k|{j}"}] for j, t in mine[:20]]
+    if len(mine) > 1:
+        rows.append([{"text": f"✖ 全部取消（{len(mine)} 個）", "callback_data": "k|all"}])
+    tg("sendMessage", {"chat_id": chat, "disable_web_page_preview": True,
+                       "text": f"要取消哪一個？⚙️ 進行中、⏳ 排隊中（共 {len(mine)} 個）",
+                       "reply_markup": json.dumps({"inline_keyboard": rows})})
 
 
 # ---------------- 遠端重新啟動 ----------------
@@ -1921,11 +2092,13 @@ def on_mode_button(mode, chat, msg_id):
 
 
 def setup_keyboard():
-    return json.dumps({"inline_keyboard": [
-        [{"text": "📥 傳回這裡", "callback_data": "s|here"}, {"text": "👥 貼到群組", "callback_data": "s|group"}],
-        [{"text": "📦 大檔案（登入帳號）", "callback_data": "s|login"},
-         {"text": "📤 上傳身分", "callback_data": "s|mode"}],
-        [{"text": "📌 釘選", "callback_data": "s|pin"}]]})
+    rows = [[{"text": "📥 傳回這裡", "callback_data": "s|here"}, {"text": "👥 貼到群組", "callback_data": "s|group"}],
+            [{"text": "📦 大檔案（登入帳號）", "callback_data": "s|login"},
+             {"text": "📤 上傳身分", "callback_data": "s|mode"}],
+            [{"text": "📌 釘選", "callback_data": "s|pin"}]]
+    if CHANNEL_ID:
+        rows[2].append({"text": "➕ 新增子頻道", "callback_data": "s|topic"})
+    return json.dumps({"inline_keyboard": rows})
 
 
 def on_pin_mode_button(mode, chat, msg_id):
@@ -1958,6 +2131,12 @@ def on_setup_button(choice, chat, msg_id):
             "reply_markup": json.dumps({"inline_keyboard": [
                 [{"text": ("✅ " if PIN_MODE == k else "") + v, "callback_data": f"pm|{k}"}]
                 for k, v in PIN_MODES.items()]})})
+    if choice == "topic":
+        if not CHANNEL_ID:
+            return edit(chat, msg_id, "要先設定群組才能新增子頻道：按「貼到群組」照著做。")
+        setup_state[chat] = {"step": "topic"}
+        return edit(chat, msg_id, "➕ 新增子頻道：把名稱傳給我，我會在群組裡建好，加進子頻道按鈕。\n"
+                                  "群組要開「話題」，我要是管理員、有「管理話題」權限。打 /cancel 取消。")
     if choice == "login":
         if os.environ.get("TELEGRAM_API_ID") and os.environ.get("TELEGRAM_API_HASH"):
             setup_state[chat] = {"step": "phone"}
@@ -1975,6 +2154,8 @@ def setup_input(chat, text, msg):
     """設定進行中：收你傳來的 api_id、api_hash、手機號碼、驗證碼、兩步驟驗證密碼。"""
     st = setup_state[chat]
     step = st["step"]
+    if step == "topic":
+        return new_topic(chat, text)
     if step == "api_id":
         if not re.fullmatch(r"\d+", text):
             return notify(chat, "api_id 應該是一串數字，再傳一次。")
@@ -2021,6 +2202,27 @@ def setup_input(chat, text, msg):
         except Exception as e:
             return notify(chat, f"❌ 密碼不對：{e}\n再傳一次，或打 /cancel 取消。")
         return login_done(chat, me)
+
+
+def new_topic(chat, text):
+    """在群組裡建一個新的子頻道（話題），加進 TOPICS。"""
+    name = re.sub(r"[,:]", "", text).strip()[:128]
+    if not name:
+        return notify(chat, "名稱不能空白（也不能只有逗號、冒號），再傳一次，或打 /cancel 取消。")
+    if name in TOPICS:
+        return notify(chat, f"已經有「{name}」了，換個名稱再傳一次，或打 /cancel 取消。")
+    try:
+        tid = tg("createForumTopic", {"chat_id": CHANNEL_ID, "name": name})["message_thread_id"]
+    except Exception as e:
+        setup_state.pop(chat, None)
+        why = str(e)
+        hint = ("群組沒開「話題」：群組設定 → 開啟「話題」。" if "forum" in why.lower() else
+                "我要是群組管理員，而且有「管理話題」權限。" if "rights" in why.lower() or "admin" in why.lower() else "")
+        return notify(chat, f"❌ 建子頻道失敗：{why[:300]}" + (f"\n{hint}" if hint else "") + "\n打 /setup 再試一次。")
+    setup_state.pop(chat, None)
+    topics = {**TOPICS, name: tid}
+    save_env(TOPICS=",".join(f"{n}:{i}" for n, i in topics.items()))
+    notify(chat, f"✅ 建好子頻道「{name}」，已加進按鈕。目前：{'、'.join(TOPICS)}")
 
 
 def login_done(chat, me):
@@ -2086,7 +2288,7 @@ def on_callback(cb):
     data = cb.get("data") or ""
     msg = cb.get("message") or {}
     chat = msg.get("chat", {}).get("id")
-    if not data.startswith(("t|", "n|")):  # 子頻道、釘選按鈕在下面回，順便跳出選了哪裡
+    if not data.startswith(("t|", "n|", "k|")):  # 子頻道、釘選、取消按鈕在下面回，順便跳出選了哪裡
         answer(cb)
     if data.startswith("r|"):
         return on_restart_button(data[2:], chat, msg.get("message_id"))
@@ -2098,6 +2300,8 @@ def on_callback(cb):
         return on_retry_button(data, chat, msg.get("message_id"))
     if data.startswith("n|"):
         return on_pin_button(data, chat, cb)
+    if data.startswith("k|"):
+        return on_cancel_button(data, chat, msg.get("message_id"), cb)
     if data.startswith("pm|"):
         return on_pin_mode_button(data[3:], chat, msg.get("message_id"))
     if data.startswith("p|"):  # 不解這個要密碼的壓縮檔了
@@ -2110,15 +2314,20 @@ def on_callback(cb):
         answer(cb)
         return notify(chat, "這個按鈕過期了，請重傳連結或檔案。")
     answer(cb, f"→ {name}")
-    # 馬上把按鈕換成「已選好」，輪到它時這則訊息會變成進度顯示
+    # 馬上把按鈕換成「已選好」＋取消，輪到它時這則訊息會變成進度顯示
     text = f"⏳ {job_label(url)} → {name}\n{wait_note() or '準備中…'}"
+    rows = []
     if PIN_MODE == "ask":  # 選完子頻道順便問要不要釘選
         pin_choice[msg["message_id"]] = None
+        rows.append(pin_row(msg["message_id"]))
+    jid = enqueue(url, chat, TOPICS[name], msg["message_id"], src)
+    rows.append(cancel_button([jid]))
+    try:
         tg("editMessageText", {"chat_id": chat, "message_id": msg["message_id"], "text": text,
-                               "disable_web_page_preview": True, "reply_markup": pin_keyboard(msg["message_id"])})
-    else:
-        edit(chat, msg["message_id"], text)
-    enqueue(url, chat, TOPICS[name], msg["message_id"], src)
+                               "disable_web_page_preview": True,
+                               "reply_markup": json.dumps({"inline_keyboard": rows})})
+    except Exception:
+        pass  # 已經輪到它、進度訊息先改掉了
 
 
 def on_retry_button(data, chat, msg_id):
@@ -2229,8 +2438,8 @@ def on_message(msg):
     if cmd == "/setup":
         setup_state.pop(chat["id"], None)
         return show_setup(chat["id"])
-    if cmd == "/cancel":
-        return cancel_setup(chat["id"])
+    if cmd == "/cancel":  # 設定到一半就取消設定，不然列出工作來取消
+        return cancel_setup(chat["id"]) if chat["id"] in setup_state else ask_cancel(chat["id"])
     if chat["id"] in setup_state and not cmd.startswith("/"):
         return setup_input(chat["id"], text.strip(), msg)
     if cmd == "/status":
@@ -2260,7 +2469,7 @@ def on_message(msg):
                 + ("貼到頻道。" if CHANNEL_ID else "傳回這裡。"))
         if TOPICS:
             hint += "\n連結前後加上子頻道名稱（" + "、".join(TOPICS) + "）就會直接貼到那裡。"
-        hint += "\n/status 看進度和電腦狀態，/setup 改設定，/restart 重新啟動。"
+        hint += "\n/status 看進度和電腦狀態，/cancel 取消下載或上傳，/setup 改設定，/restart 重新啟動。"
         return notify(chat["id"], hint)
 
     tid = find_topic(text)
@@ -2270,22 +2479,38 @@ def on_message(msg):
         return
     tid = default_topic() if tid is None else tid
     note = wait_note()
-    for url in urls:
-        enqueue(url, chat["id"], tid, src=msg.get("message_id"))
+    jids = [enqueue(url, chat["id"], tid, src=msg.get("message_id")) for url in urls]
     where = topic_name(tid)
-    notify(chat["id"], f"⏳ 收到 {len(urls)} 個連結" + (f" → {where}" if where else "")
-           + (f"，{note}" if note else ""))
+    notify_queued(chat["id"], f"⏳ 收到 {len(urls)} 個連結" + (f" → {where}" if where else "")
+                  + (f"，{note}" if note else ""), jids)
+
+
+# 一次等新訊息最多幾秒。以前等 50 秒：網路設備常把這種閒著的連線悄悄切掉，
+# 程式要等到 60 秒逾時才發現，再休息 5 秒，這段時間傳的連結、按的按鈕都沒反應
+POLL_SECONDS = 10
 
 
 def poll():
+    """收新訊息用自己的一條連線，不跟上傳、改進度的請求搶；卡住就丟掉換一條新的，馬上重試。"""
     global poll_offset
+    session, fails = None, 0
     while True:
+        if session is None:
+            session = requests.Session()
         try:
-            ups = tg("getUpdates", {"timeout": 50, "offset": poll_offset,
-                                    "allowed_updates": json.dumps(["message", "callback_query"])}, timeout=60)
+            r = session.post(f"{API}/getUpdates", data={
+                "timeout": POLL_SECONDS, "offset": poll_offset,
+                "allowed_updates": json.dumps(["message", "callback_query"])}, timeout=(5, POLL_SECONDS + 10))
+            body = r.json()
+            if not body.get("ok"):
+                raise RuntimeError(body.get("description"))
+            ups, fails = body["result"], 0
         except Exception as e:
-            log.warning("getUpdates：%s", e)
-            time.sleep(5)
+            log.warning("getUpdates：%s", str(e).replace(BOT_TOKEN, "***"))
+            session.close()
+            session = None
+            fails += 1
+            time.sleep(min(fails - 1, 5))  # 第一次馬上換新連線重試，一直失敗（斷網）才慢慢等
             continue
         for u in ups:
             poll_offset = u["update_id"] + 1
@@ -2333,6 +2558,7 @@ def main():
         tg("setMyCommands", {"commands": json.dumps([
             {"command": "status", "description": "看進度和電腦狀態（CPU、RAM、GPU）"},
             {"command": "setup", "description": "設定：傳到哪裡、群組子頻道、大檔案"},
+            {"command": "cancel", "description": "取消下載或上傳（排隊中、進行中都可以）"},
             {"command": "retry", "description": "重試之前失敗的"},
             {"command": "restart", "description": "重新啟動機器人"}])})
     except Exception as e:

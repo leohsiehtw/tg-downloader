@@ -33,8 +33,14 @@ def _same_name(a, b):
     return a == b or clean(a) == clean(b)
 
 
+class Stopped(Exception):
+    """bot.py 那邊按了取消。"""
+
+
 def _client():
-    return TelegramClient(SESSION, int(os.environ["TELEGRAM_API_ID"]), os.environ["TELEGRAM_API_HASH"])
+    # 只拿來上傳、下載，不用收你帳號所有群組、頻道的新訊息（收那些會一直佔網路）
+    return TelegramClient(SESSION, int(os.environ["TELEGRAM_API_ID"]), os.environ["TELEGRAM_API_HASH"],
+                          receive_updates=False)
 
 
 def _probe(path: Path):
@@ -68,6 +74,7 @@ class Uploader:
     def __init__(self):
         self.entities = {}  # 貼過的對象（群組 id、機器人 username）
         self.on_wait = lambda seconds: None  # Telegram 限流要等時，告訴 bot.py 等多久
+        self.stop = lambda: False  # bot.py 按了取消就回傳 True
         self.loop = asyncio.new_event_loop()
         threading.Thread(target=self.loop.run_forever, daemon=True).start()
         self._run(self._start())
@@ -107,11 +114,16 @@ class Uploader:
                 return await make()
             except FloodWaitError as e:
                 self.on_wait(e.seconds)
-                await asyncio.sleep(e.seconds + 2)
+                for _ in range(e.seconds + 2):  # 一秒一秒等，中間按取消就不等了
+                    if self.stop():
+                        raise Stopped("已取消")
+                    await asyncio.sleep(1)
                 self.on_wait(0)
 
     def _tick(self, p: Path, sent=0):
-        """回報整批的上傳進度（給 bot.py 顯示在 Telegram 私訊裡）。"""
+        """回報整批的上傳進度（給 bot.py 顯示在 Telegram 私訊裡）；按了取消就丟 Stopped 讓上傳停下來。"""
+        if self.stop():
+            raise Stopped("已取消")
         try:
             self.progress(p.name, self.order.index(p) + 1, len(self.order), self.done + sent, self.total)
         except Exception:
@@ -166,12 +178,14 @@ class Uploader:
             first = False
         return sent
 
-    def send(self, paths, caption, thread_id=0, progress=None, to=None, on_wait=None):
+    def send(self, paths, caption, thread_id=0, progress=None, to=None, on_wait=None, stop=None):
         """回傳 Telegram 確認收到的則數。progress(檔名, 第幾個, 共幾個, 已傳 bytes, 總 bytes) 用來顯示進度。
         to：貼到哪，群組 id 或機器人的 username（就是貼到你跟機器人的聊天）。
-        on_wait(秒數)：被 Telegram 限流、要停下來等時呼叫；等完會再呼叫一次 on_wait(0)。"""
+        on_wait(秒數)：被 Telegram 限流、要停下來等時呼叫；等完會再呼叫一次 on_wait(0)。
+        stop()：回傳 True 就停下來，丟出 Stopped。"""
         self.progress = progress or (lambda *a: None)
         self.on_wait = on_wait or (lambda seconds: None)
+        self.stop = stop or (lambda: False)
         return self._run(self._send(list(paths), caption, thread_id, to))
 
     def pin(self, to, msg_id):
