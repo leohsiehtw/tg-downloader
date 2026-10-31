@@ -196,12 +196,17 @@ def cancel_button(jids):
     return [{"text": "✖ 取消", "callback_data": data}] if len(data.encode()) <= 64 else []
 
 
-def notify_queued(chat, text, jids):
-    """「收到了、排進去了」的訊息，附取消按鈕。"""
+def link_preview(url):
+    """訊息附上連結的小縮圖預覽（網站有提供的話），一眼看出是哪則貼文。"""
+    return {"link_preview_options": json.dumps({"url": url, "prefer_small_media": True})}
+
+
+def notify_queued(chat, text, jids, url=None):
+    """「收到了、排進去了」的訊息，附取消按鈕；只有一個連結的話附上它的縮圖。"""
     if chat is None:
         return
     row = cancel_button(jids)
-    data = {"chat_id": chat, "text": text, "disable_web_page_preview": True}
+    data = {"chat_id": chat, "text": text, **(link_preview(url) if url else {"disable_web_page_preview": True})}
     if row:
         data["reply_markup"] = json.dumps({"inline_keyboard": [row]})
     try:
@@ -1754,8 +1759,8 @@ def ask_topic(chat, what, label, src=None):
         return
     key = f"{int(time.time() * 1000) % 10**9}-{len(pending)}"
     pending[key] = (what, src)
-    tg("sendMessage", {"chat_id": chat, "text": f"要貼到哪個子頻道？\n{label}",
-                       "disable_web_page_preview": True, "reply_markup": topic_keyboard(key)})
+    tg("sendMessage", {"chat_id": chat, "text": f"要貼到哪個子頻道？\n{label}", "reply_markup": topic_keyboard(key),
+                       **(link_preview(what) if isinstance(what, str) else {"disable_web_page_preview": True})})
 
 
 def total_size(paths):
@@ -2676,7 +2681,8 @@ def on_message(msg):
     jids = [enqueue(url, chat["id"], tid, src=msg.get("message_id")) for url in urls]
     where = topic_name(tid)
     notify_queued(chat["id"], f"⏳ 收到 {len(urls)} 個連結" + (f" → {where}" if where else "")
-                  + (f"，{note}" if note else ""), jids)
+                  + (f"，{note}" if note else "") + (f"\n{urls[0]}" if len(urls) == 1 else ""), jids,
+                  urls[0] if len(urls) == 1 else None)
 
 
 # 一次等新訊息最多幾秒。以前等 50 秒：網路設備常把這種閒著的連線悄悄切掉，
