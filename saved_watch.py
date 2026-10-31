@@ -21,7 +21,7 @@ SOURCES = {
     "x": ("X 書籤", "https://x.com/i/bookmarks"),
 }
 SEEN_FILE = Path(__file__).with_name(".saved-seen.json")
-PEEK = 30  # 每次看最新幾則；兩次傳連結之間收藏超過這麼多則，多的會漏掉
+PEEK = 100  # 每次看最新幾則；兩次傳連結之間收藏超過這麼多則，多的會漏掉
 KEEP = 1000  # 每個來源最多記幾個看過的 id
 
 _lock = threading.Lock()
