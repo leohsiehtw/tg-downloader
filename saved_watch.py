@@ -66,8 +66,9 @@ def profile(url):
     return None
 
 
-def posts(url, src, cookies, peek=None):
-    """用 gallery-dl 列出網址裡的貼文 [(id, 貼文網址)]，最新的在前面；src 是 "ig" 或 "x"。"""
+def posts(url, src, cookies, peek=None, procs=None):
+    """用 gallery-dl 列出網址裡的貼文 [(id, 貼文網址)]，最新的在前面；src 是 "ig" 或 "x"。
+    procs：有給的話列清單時把 gallery-dl 放進去，按取消時 bot.py 才砍得掉。"""
     tmp = Path(tempfile.mkdtemp(prefix="tgdl-saved-"))
     try:
         cmd = [sys.executable, "-m", "gallery_dl", "-j", url]
@@ -77,8 +78,20 @@ def posts(url, src, cookies, peek=None):
             mine = tmp / "cookies.txt"
             shutil.copyfile(cookies, mine)
             cmd[3:3] = ["--cookies", str(mine)]
-        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                           timeout=300 if peek else 3600, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, encoding="utf-8", errors="replace",
+                             creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if procs is not None:
+            procs.add(p)
+        try:
+            out, err = p.communicate(timeout=300 if peek else 3600)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            out, err = p.communicate()
+        finally:
+            if procs is not None:
+                procs.discard(p)
+        r = subprocess.CompletedProcess(cmd, p.returncode, out, err)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     try:

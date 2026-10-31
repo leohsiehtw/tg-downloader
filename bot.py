@@ -1287,8 +1287,12 @@ def queue_profile(url, reply_chat, thread_id):
     """個人主頁連結：列出這個帳號全部的貼文，一則一則排進下載（舊的先），貼到同一個地方。"""
     src, listing = saved_watch.profile(url)
     status("📋 列出這個帳號的全部貼文，貼文多的話要等幾分鐘…")
-    items = saved_watch.posts(listing, src, cookie_file())
+    ticket = getattr(_local, "ticket", None)
     check_cancel()
+    try:
+        items = saved_watch.posts(listing, src, cookie_file(), procs=ticket.procs if ticket else None)
+    finally:
+        check_cancel()  # 按取消砍掉 gallery-dl 時算取消，不算失敗
     if not items:
         raise RuntimeError("這個帳號沒有抓到任何貼文（私人帳號要 cookies 那個帳號有追蹤）")
     new = saved_watch.profile_new(listing, items)
