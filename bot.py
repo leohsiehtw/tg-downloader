@@ -538,6 +538,7 @@ def status_text():
 _net = []  # 上次量網路的 (時間, 已送出, 已收到)
 _disk = []  # 上次量硬碟的 (時間, 已讀, 已寫)
 _gpu = [0.0, []]  # (上次查的時間, 結果)
+_top = [0.0, ""]  # (上次找最忙程式的時間, 結果)
 STATS = {"files": 0, "bytes": 0, "failed": 0, "downloaded": 0}  # 這次啟動後傳了多少、失敗幾次
 TOTALS_FILE = Path(__file__).with_name(".totals.json")  # 從開始用到現在總共處理了多少（重啟也不會歸零）
 _totals_lock = threading.Lock()
@@ -671,7 +672,12 @@ def pc_text():
 
 
 def busiest(psutil):
-    """CPU 用最多的程式（跟上次查的時候比）。第一次查還沒有數字，會是空的。"""
+    """CPU 用最多的程式（跟上次查的時候比）。第一次查還沒有數字，會是空的。
+    掃一遍所有程式要 0.3 秒 CPU，/status 每 3 秒更新一次的話光這個就很忙，所以 15 秒才重找一次。"""
+    now = time.time()
+    if now - _top[0] < 15:
+        return _top[1]
+    _top[0] = now
     cores = psutil.cpu_count() or 1
     best = None
     for proc in psutil.process_iter(["name", "cpu_percent"]):
@@ -680,7 +686,8 @@ def busiest(psutil):
             continue
         if best is None or info["cpu_percent"] > best[1]:
             best = (info["name"], info["cpu_percent"])
-    return f"{best[0]} {best[1] / cores:.0f}%" if best and best[1] / cores >= 1 else ""
+    _top[1] = f"{best[0]} {best[1] / cores:.0f}%" if best and best[1] / cores >= 1 else ""
+    return _top[1]
 
 
 _dashboard = {}  # 正在更新的 /status 訊息
@@ -1065,7 +1072,7 @@ def fit_photo(p: Path, out_dir: Path | None = None):
                 size = (max(1, int(w * scale)), max(1, int(h * scale)))
                 img = im if size == im.size else im.resize(size, Image.LANCZOS)
                 for q in (92, 85):
-                    img.save(out, "JPEG", quality=q, optimize=True)
+                    img.save(out, "JPEG", quality=q)  # 不加 optimize：多花三成 CPU，只小幾 %，Telegram 也會再壓
                     if out.stat().st_size <= PHOTO_MAX_BYTES:
                         break
                 else:
