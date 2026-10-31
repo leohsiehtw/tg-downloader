@@ -1759,8 +1759,11 @@ def ask_topic(chat, what, label, src=None):
         return
     key = f"{int(time.time() * 1000) % 10**9}-{len(pending)}"
     pending[key] = (what, src)
-    tg("sendMessage", {"chat_id": chat, "text": f"要貼到哪個子頻道？\n{label}", "reply_markup": topic_keyboard(key),
-                       **(link_preview(what) if isinstance(what, str) else {"disable_web_page_preview": True})})
+    data = {"chat_id": chat, "text": f"要貼到哪個子頻道？\n{label}", "reply_markup": topic_keyboard(key)}
+    try:
+        tg("sendMessage", {**data, **(link_preview(what) if isinstance(what, str) else {"disable_web_page_preview": True})})
+    except RuntimeError:  # 預覽出問題也要把按鈕送出去，不然這個連結就沒下文了
+        tg("sendMessage", {**data, "disable_web_page_preview": True})
 
 
 def total_size(paths):
