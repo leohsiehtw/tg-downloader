@@ -2640,6 +2640,15 @@ def on_message(msg):
         return notify(chat["id"], hint)
 
     watch_now()
+    profiles = [u for u in urls if saved_watch.profile(u)]
+    for url in profiles:  # 個人主頁照平台自動貼到「IG」「X」子頻道，跟收藏一樣
+        watch_enqueue(url, saved_watch.profile(url)[0])
+    if profiles:
+        notify(chat["id"], f"⏳ 收到 {len(profiles)} 個主頁，會貼到" + (
+            "、".join(dict.fromkeys(f"子頻道「{WATCH_TOPICS[saved_watch.profile(u)[0]]}」" for u in profiles)) if CHANNEL_ID else "這裡"))
+    urls = [u for u in urls if u not in profiles]
+    if not urls:
+        return
     tid = find_topic(text)
     if tid is None and TOPICS and not DEFAULT_TOPIC:
         for url in urls:
