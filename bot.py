@@ -2295,12 +2295,27 @@ WATCH_TOPICS = {"ig": "IG", "x": "X"}  # 各來源貼到哪個子頻道，沒有
 _topic_lock = threading.Lock()
 
 
+def topic_alive(tid, name):
+    """子頻道還在嗎？貼到被刪掉的子頻道 Telegram 不會報錯，會跑到 General。
+    用同樣的名稱改名試探：還在會回「沒改到」，被刪了回 TOPIC_ID_INVALID。"""
+    try:
+        tg("editForumTopic", {"chat_id": CHANNEL_ID, "message_thread_id": tid, "name": name})
+    except RuntimeError as e:
+        return "TOPIC_ID_INVALID" not in str(e)
+    except Exception:
+        pass  # 網路問題之類的，當作還在
+    return True
+
+
 def watch_topic(src):
     """這個來源的子頻道 id；群組裡還沒有就建一個。沒設群組（傳回私訊）回傳 0。"""
     if not CHANNEL_ID:
         return 0
     name = WATCH_TOPICS[src]
     with _topic_lock:  # IG、X 同時有新的時不要建兩個
+        if name in TOPICS and not topic_alive(TOPICS[name], name):
+            log.info("子頻道 %s 被刪掉了，重建", name)
+            save_env(TOPICS=",".join(f"{n}:{i}" for n, i in TOPICS.items() if n != name))
         if name not in TOPICS:
             tid = tg("createForumTopic", {"chat_id": CHANNEL_ID, "name": name})["message_thread_id"]
             save_env(TOPICS=",".join(f"{n}:{i}" for n, i in {**TOPICS, name: tid}.items()))
