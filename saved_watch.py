@@ -1,18 +1,16 @@
 """
-自動抓 IG 收藏、X 書籤：每隔一段時間用 gallery-dl 看最新的幾則，沒處理過的就排進下載。
+自動抓 IG 收藏、X 書籤：你傳連結給機器人時，順便用 gallery-dl 看最新的幾則，沒處理過的就排進下載。
 
 第一次開某個來源時，只把現有的全部記成「看過了」，不會把以前的收藏一次全下載；
 之後新收藏的才會下載。看過的 id 存在 .saved-seen.json。
 """
 import json
 import logging
-import random
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
-import time
 from pathlib import Path
 
 log = logging.getLogger("tg-downloader")
@@ -23,7 +21,7 @@ SOURCES = {
     "x": ("X 書籤", "https://x.com/i/bookmarks"),
 }
 SEEN_FILE = Path(__file__).with_name(".saved-seen.json")
-PEEK = 20  # 每次看最新幾則；兩次檢查之間收藏超過這麼多則，多的會漏掉
+PEEK = 30  # 每次看最新幾則；兩次傳連結之間收藏超過這麼多則，多的會漏掉
 KEEP = 1000  # 每個來源最多記幾個看過的 id
 
 _lock = threading.Lock()
@@ -103,24 +101,29 @@ def forget(src):
             save_seen(seen)
 
 
-def run(enabled, cookies, enqueue, warn, minutes):
-    """背景執行緒。enabled() 回傳現在開著的來源代號；cookies() 回傳 cookies 檔路徑；
-    enqueue(網址, 來源代號) 排進下載；warn(文字) 通知主人；minutes() 回傳幾分鐘檢查一次。"""
-    broken = set()  # 已經通知過抓不到的來源，恢復前不再重複通知
-    while True:
-        for src in enabled():
+_busy = threading.Lock()  # 已經在檢查就不再開一輪
+_broken = set()  # 已經通知過抓不到的來源，恢復前不再重複通知
+
+
+def check_all(enabled, cookies, enqueue, warn):
+    """你傳連結時在背景跑一輪。enabled：開著的來源代號；cookies：cookies 檔路徑；
+    enqueue(網址, 來源代號) 排進下載；warn(文字) 通知主人。"""
+    if not enabled or not _busy.acquire(blocking=False):
+        return
+    try:
+        for src in enabled:
             try:
-                n = check(src, cookies(), enqueue)
+                n = check(src, cookies, enqueue)
                 if n:
                     log.info("%s：%d 則新的", SOURCES[src][0], n)
-                if src in broken:
-                    broken.discard(src)
+                if src in _broken:
+                    _broken.discard(src)
                     warn(f"✅ {SOURCES[src][0]} 又抓得到了。")
             except Exception as e:
                 log.warning("檢查 %s 失敗：%s", SOURCES[src][0], e)
-                if src not in broken:
-                    broken.add(src)
+                if src not in _broken:
+                    _broken.add(src)
                     warn(f"⚠️ 抓不到{SOURCES[src][0]}，可能是 cookies 過期或被網站擋了。"
                          f"恢復前不會再通知。\n{str(e)[:300]}")
-        # 加一點隨機，不要每次都在整點同一秒去敲網站
-        time.sleep(max(5, minutes()) * 60 * random.uniform(0.85, 1.15))
+    finally:
+        _busy.release()

@@ -2012,6 +2012,7 @@ class Handler(BaseHTTPRequestHandler):
             urls, topic = [], ""
         if not urls:
             return self._send(400, {"ok": False, "error": "找不到網址"})
+        watch_now()
         notify_chat = next(iter(ALLOWED_USER_IDS), None)
         tid = find_topic(f"{topic} {text}")
         tid = default_topic() if tid is None else tid
@@ -2283,8 +2284,11 @@ def watching():
     return [s for s in os.environ.get("WATCH_SAVED", "").split(",") if s in saved_watch.SOURCES]
 
 
-def watch_minutes():
-    return int(os.environ.get("WATCH_MINUTES", "20") or 20)
+def watch_now():
+    """你傳連結時順便在背景檢查收藏、書籤（不會卡住這則連結）。"""
+    if watching():
+        threading.Thread(target=saved_watch.check_all, daemon=True,
+                         args=(watching(), cookie_file(), watch_enqueue, watch_warn)).start()
 
 
 WATCH_TOPICS = {"ig": "IG", "x": "X"}  # 各來源貼到哪個子頻道，沒有就自動建
@@ -2327,7 +2331,7 @@ def watch_warn(text):
 
 def watch_text():
     on = watching()
-    lines = ["🔖 收藏 / 書籤後自動下載", f"每 {watch_minutes()} 分鐘看一次最新 {saved_watch.PEEK} 則，用 cookies 資料夾的登入。"]
+    lines = ["🔖 收藏 / 書籤後自動下載", f"你每次傳連結給我時，順便看最新 {saved_watch.PEEK} 則，用 cookies 資料夾的登入。"]
     for k, (name, _) in saved_watch.SOURCES.items():
         lines.append(f"{name}：{'開' if k in on else '關'}")
     if CHANNEL_ID:
@@ -2573,6 +2577,7 @@ def on_message(msg):
         hint += "\n/status 看進度和電腦狀態，/cancel 取消下載或上傳，/watch 收藏後自動下載，/setup 改設定，/restart 重新啟動。"
         return notify(chat["id"], hint)
 
+    watch_now()
     tid = find_topic(text)
     if tid is None and TOPICS and not DEFAULT_TOPIC:
         for url in urls:
@@ -2699,8 +2704,6 @@ def main():
         threading.Thread(target=download_worker, daemon=True).start()
     threading.Thread(target=upload_worker, daemon=True).start()
     threading.Thread(target=watch_folder, daemon=True).start()
-    threading.Thread(target=saved_watch.run, daemon=True,
-                     args=(watching, cookie_file, watch_enqueue, watch_warn, watch_minutes)).start()
     if ENABLE_POLLING:
         threading.Thread(target=poll, daemon=True).start()
     if SHARED_SECRET:
