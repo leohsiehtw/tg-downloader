@@ -102,8 +102,10 @@ URL_RE = re.compile(r"https?://\S+")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("tg-downloader")
 
-# 下載可以好幾個同時跑；上傳一次一個（同時傳只會互搶頻寬，Telegram 也容易限流）
+# 下載可以好幾個同時跑；轉檔、上傳預設各兩個（再多只會互搶 CPU、頻寬，Telegram 也容易限流）
 DOWNLOAD_WORKERS = int(os.environ.get("DOWNLOAD_WORKERS", "3"))
+ENCODE_WORKERS = max(int(os.environ.get("ENCODE_WORKERS", "2")), 1)
+UPLOAD_WORKERS = max(int(os.environ.get("UPLOAD_WORKERS", "2")), 1)
 # 等下載的：(網址、檔案清單或壓縮檔, 通知對象, 子頻道 id, 拿來顯示進度的訊息 id, 原訊息 id, 工作 id)
 jobs: queue.Queue = queue.Queue()
 uploads: queue.Queue = queue.Queue()  # 下載好、等上傳的：(Progress, 上傳要做的事)
@@ -973,12 +975,12 @@ _gpu_exe = Path(__file__).with_name("ffmpeg-gpu") / "ffmpeg.exe"
 GPU_FFMPEG = str(_gpu_exe) if _gpu_exe.exists() else "ffmpeg"
 
 
-_encode_lock = threading.RLock()
+_encode_lock = threading.BoundedSemaphore(ENCODE_WORKERS)
 
 
 @contextlib.contextmanager
 def encode_turn(name):
-    """轉檔、壓縮很吃 CPU 和顯卡，同時下載好幾個時也一次只做一支，其他的等。"""
+    """轉檔、壓縮很吃 CPU 和顯卡，同時下載好幾個時最多 ENCODE_WORKERS 支一起做，其他的等。"""
     if not _encode_lock.acquire(blocking=False):
         status(f"🎞 等前一支轉檔完：{name}")
         while not _encode_lock.acquire(timeout=1):
@@ -1230,14 +1232,15 @@ def upload(files, caption, thread_id, chat=None):
             up = user_uploader()
             ticket = getattr(_local, "ticket", None)
             try:
-                sent += up.send(by_user, caption="" if by_bot else caption, thread_id=thread_id,
+                n, first_id = up.send(by_user, caption="" if by_bot else caption, thread_id=thread_id,
                                 progress=upload_meter(), to=CHANNEL_ID or BOT_USERNAME, on_wait=flood_notice(),
                                 stop=lambda: ticket is not None and ticket.cancelled)
+                sent += n
             except Exception:
                 check_cancel()  # 按了取消才停的就算取消，不算失敗
                 raise
-            if up.first_id:
-                posted(("user", CHANNEL_ID or BOT_USERNAME, up.first_id))
+            if first_id:
+                posted(("user", CHANNEL_ID or BOT_USERNAME, first_id))
         if sent != len(ok):
             raise RuntimeError(f"只確認到 {sent}/{len(ok)} 個檔案上傳成功")
         count(files=len(ok), bytes=total_size(ok))
@@ -1849,7 +1852,7 @@ def download_worker():
 
 
 def upload_worker():
-    """上傳一次一個。"""
+    """上傳；UPLOAD_WORKERS 個一起跑。"""
     while True:
         progress, send, _local.job = uploads.get()
         _local.progress = progress
@@ -2788,7 +2791,8 @@ def main():
     cookie_file()  # 記錄現在用了哪些 cookies 檔
     for _ in range(max(DOWNLOAD_WORKERS, 1)):
         threading.Thread(target=download_worker, daemon=True).start()
-    threading.Thread(target=upload_worker, daemon=True).start()
+    for _ in range(UPLOAD_WORKERS):
+        threading.Thread(target=upload_worker, daemon=True).start()
     threading.Thread(target=watch_folder, daemon=True).start()
     if ENABLE_POLLING:
         threading.Thread(target=poll, daemon=True).start()

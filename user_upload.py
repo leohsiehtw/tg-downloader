@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import types
 from pathlib import Path
 
 from telethon import TelegramClient
@@ -73,8 +74,6 @@ class Uploader:
 
     def __init__(self):
         self.entities = {}  # 貼過的對象（群組 id、機器人 username）
-        self.on_wait = lambda seconds: None  # Telegram 限流要等時，告訴 bot.py 等多久
-        self.stop = lambda: False  # bot.py 按了取消就回傳 True
         self.loop = asyncio.new_event_loop()
         threading.Thread(target=self.loop.run_forever, daemon=True).start()
         self._run(self._start())
@@ -106,46 +105,46 @@ class Uploader:
         finally:
             self.loop.call_soon_threadsafe(self.loop.stop)
 
-    async def _patient(self, make):
+    async def _patient(self, job, make):
         """Telegram 限流（FloodWait，傳太多照片時常要等十幾二十分鐘）：照它說的秒數等完再重做，不要直接失敗。
         相簿要整組上傳完才會貼出，所以重做不會重複貼。"""
         while True:
             try:
                 return await make()
             except FloodWaitError as e:
-                self.on_wait(e.seconds)
+                job.on_wait(e.seconds)
                 for _ in range(e.seconds + 2):  # 一秒一秒等，中間按取消就不等了
-                    if self.stop():
+                    if job.stop():
                         raise Stopped("已取消")
                     await asyncio.sleep(1)
-                self.on_wait(0)
+                job.on_wait(0)
 
-    def _tick(self, p: Path, sent=0):
+    def _tick(self, job, p: Path, sent=0):
         """回報整批的上傳進度（給 bot.py 顯示在 Telegram 私訊裡）；按了取消就丟 Stopped 讓上傳停下來。"""
-        if self.stop():
+        if job.stop():
             raise Stopped("已取消")
         try:
-            self.partial[p] = sent
-            self.progress(p.name, self.order.index(p) + 1, len(self.order),
-                          self.done + sum(self.partial.values()), self.total)
+            job.partial[p] = sent
+            job.progress(p.name, job.order.index(p) + 1, len(job.order),
+                         job.done + sum(job.partial.values()), job.total)
         except Exception:
             pass
 
-    async def _up(self, p: Path):
+    async def _up(self, job, p: Path):
         """上傳一個檔案。每塊用最大的 512KB（Telethon 預設 128KB），一塊一塊等回應，塊越大來回越少、越快。"""
-        file = await self._patient(lambda: self.client.upload_file(
-            str(p), part_size_kb=512, progress_callback=lambda s, _: self._tick(p, s)))
-        self.partial.pop(p, None)
-        self.done += p.stat().st_size
+        file = await self._patient(job, lambda: self.client.upload_file(
+            str(p), part_size_kb=512, progress_callback=lambda s, _: self._tick(job, p, s)))
+        job.partial.pop(p, None)
+        job.done += p.stat().st_size
         return file
 
-    async def _media(self, p: Path, tmp):
+    async def _media(self, job, p: Path, tmp):
         """先自己上傳；影片再附上長寬秒數和縮圖，才能跟照片一起放進同一則相簿。"""
         if p.suffix.lower() not in VIDEO_EXT:
-            return await self._up(p)
+            return await self._up(job, p)
         dur, w, h = _probe(p)
         t = _thumb(p, tmp)
-        file = await self._up(p)
+        file = await self._up(job, p)
         return InputMediaUploadedDocument(
             file=file,
             mime_type=mimetypes.guess_type(p.name)[0] or "video/mp4",
@@ -153,15 +152,15 @@ class Uploader:
                         DocumentAttributeFilename(p.name)],
             thumb=await self.client.upload_file(t) if t else None)
 
-    async def _send(self, paths, caption, thread_id, to):
+    async def _send(self, job, paths, caption, thread_id, to):
         entity = await self._entity(to)
         reply_to = thread_id or None
         album = [p for p in paths if p.suffix.lower() in VIDEO_EXT
                  or (p.suffix.lower() in IMAGE_EXT and p.stat().st_size <= PHOTO_MAX_BYTES)]
         others = [p for p in paths if p not in album]
-        self.order, self.done, self.total = album + others, 0, sum(p.stat().st_size for p in paths)
-        self.partial = {}  # 同時上傳中的檔案各傳了多少
-        self.first_id = None  # 這次貼出去的第一則（bot.py 要釘選用）
+        job.order, job.done, job.total = album + others, 0, sum(p.stat().st_size for p in paths)
+        job.partial = {}  # 同時上傳中的檔案各傳了多少
+        job.first_id = None  # 這次貼出去的第一則（bot.py 要釘選用）
         first = True
         sent = 0
         with tempfile.TemporaryDirectory(prefix="tgthumb-") as tmp:
@@ -169,33 +168,33 @@ class Uploader:
             for i in range(0, len(album), 10):
                 group = album[i:i + 10]
                 # 同一組的檔案同時上傳：一個一個傳的話大部分時間都在等 Telegram 回應
-                batch = await asyncio.gather(*(self._media(p, tmp) for p in group))
-                self._tick(group[-1])
-                r = await self._patient(lambda: self.client.send_file(
+                batch = await asyncio.gather(*(self._media(job, p, tmp) for p in group))
+                self._tick(job, group[-1])
+                r = await self._patient(job, lambda: self.client.send_file(
                     entity, batch if len(batch) > 1 else batch[0], caption=(caption or None) if first else None,
                     reply_to=reply_to, supports_streaming=True))
                 sent += len(r) if isinstance(r, list) else 1
-                self.first_id = self.first_id or (r[0] if isinstance(r, list) else r).id
+                job.first_id = job.first_id or (r[0] if isinstance(r, list) else r).id
                 first = False
         for p in others:  # gif、太大的圖片和其他檔案逐一送
-            file = await self._up(p)
-            r = await self._patient(lambda p=p: self.client.send_file(
+            file = await self._up(job, p)
+            r = await self._patient(job, lambda p=p: self.client.send_file(
                 entity, file, caption=(caption or None) if first else None, reply_to=reply_to,
                 force_document=p.suffix.lower() in IMAGE_EXT))
             sent += 1
-            self.first_id = self.first_id or r.id
+            job.first_id = job.first_id or r.id
             first = False
         return sent
 
     def send(self, paths, caption, thread_id=0, progress=None, to=None, on_wait=None, stop=None):
-        """回傳 Telegram 確認收到的則數。progress(檔名, 第幾個, 共幾個, 已傳 bytes, 總 bytes) 用來顯示進度。
+        """回傳 (Telegram 確認收到的則數, 貼出去的第一則 id)。好幾個執行緒可以同時呼叫。progress(檔名, 第幾個, 共幾個, 已傳 bytes, 總 bytes) 用來顯示進度。
         to：貼到哪，群組 id 或機器人的 username（就是貼到你跟機器人的聊天）。
         on_wait(秒數)：被 Telegram 限流、要停下來等時呼叫；等完會再呼叫一次 on_wait(0)。
         stop()：回傳 True 就停下來，丟出 Stopped。"""
-        self.progress = progress or (lambda *a: None)
-        self.on_wait = on_wait or (lambda seconds: None)
-        self.stop = stop or (lambda: False)
-        return self._run(self._send(list(paths), caption, thread_id, to))
+        job = types.SimpleNamespace(progress=progress or (lambda *a: None),
+                                    on_wait=on_wait or (lambda seconds: None), stop=stop or (lambda: False))
+        sent = self._run(self._send(job, list(paths), caption, thread_id, to))
+        return sent, job.first_id
 
     def pin(self, to, msg_id):
         """釘選你的帳號貼出去的訊息（不通知群組成員）。"""

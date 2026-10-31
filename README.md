@@ -56,6 +56,8 @@ ffmpeg、7-Zip 和 Python 套件會在第一次設定時自動安裝（透過 wi
 | `TELEGRAM_API_ID`、`TELEGRAM_API_HASH` | my.telegram.org 拿到的值，用你的帳號傳大檔案時需要 |
 | `UPLOAD_AS_USER` | 上傳身分：`0`＝全部機器人傳（上限 50MB）；`big`＝50MB 以下機器人傳，大檔用你的帳號；`1`＝全部用你的帳號（上限 2GB） |
 | `DOWNLOAD_WORKERS` | 同時下載幾個連結，預設 3 |
+| `ENCODE_WORKERS` | 同時轉檔、壓縮幾支影片，預設 2 |
+| `UPLOAD_WORKERS` | 同時上傳幾個工作，預設 2；要照順序貼就設 1 |
 
 ## 平常怎麼用
 1. 在任何 App 按「分享」→ **Telegram** → 選你的機器人 → 傳送。
