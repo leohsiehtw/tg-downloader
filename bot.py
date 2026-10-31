@@ -1284,9 +1284,12 @@ def queue_profile(url, reply_chat, thread_id):
     check_cancel()
     if not items:
         raise RuntimeError("這個帳號沒有抓到任何貼文（私人帳號要 cookies 那個帳號有追蹤）")
-    for _, post in reversed(items):
+    new = saved_watch.profile_new(listing, items)
+    for _, post in reversed(new):
         enqueue(post, reply_chat, thread_id)
-    notify(reply_chat, f"📋 {url}\n共 {len(items)} 則貼文都排進下載了，舊的先，會貼到{place(thread_id)}。")
+    old = f"（之前下載過的 {len(items) - len(new)} 則跳過）" if len(new) < len(items) else ""
+    notify(reply_chat, f"📋 {url}\n共 {len(items)} 則貼文，{len(new)} 則排進下載{old}，舊的先，會貼到{place(thread_id)}。"
+           if new else f"📋 {url}\n{len(items)} 則貼文之前都下載過了，沒有新的。")
 
 
 _uploader = None

@@ -131,6 +131,18 @@ def backfill(src, cookies, enqueue):
     return len(items)
 
 
+def profile_new(listing, items):
+    """同一個主頁發過就只留沒下載過的貼文，並把這次的全部記成下載過。不設上限，帳號貼文再多也記得住。"""
+    key = "profile:" + listing.lower()
+    with _lock:
+        seen = load_seen()
+        known = set(seen.get(key, []))
+        new = [(i, u) for i, u in items if i not in known]
+        seen[key] = [i for i, _ in new] + seen.get(key, [])
+        save_seen(seen)
+    return new
+
+
 def forget(src):
     """關掉某個來源時忘掉看過的清單，下次開啟會重新從「現在」開始算，不會補下載關掉期間的收藏。"""
     with _lock:
