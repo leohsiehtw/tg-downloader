@@ -2300,6 +2300,20 @@ def watching():
     return [s for s in os.environ.get("WATCH_SAVED", "").split(",") if s in saved_watch.SOURCES]
 
 
+def refresh(chat):
+    """/refresh：馬上檢查收藏、書籤，告訴你抓到幾則新的。"""
+    if not watching():
+        return notify(chat, "還沒開自動下載收藏，打 /watch 開啟 IG 收藏或 X 書籤。")
+    notify(chat, "🔄 檢查收藏和書籤中…")
+    r = saved_watch.check_all(watching(), cookie_file(), watch_enqueue, watch_warn)
+    if r is None:
+        return notify(chat, "剛好已經在檢查了，等一下新的就會開始下載。")
+    found, errors = r
+    lines = [f"{saved_watch.SOURCES[k][0]}：{found[k]} 則新的" if k in found
+             else f"{saved_watch.SOURCES[k][0]}：抓不到（{str(errors[k])[:150]}）" for k in watching()]
+    notify(chat, "🔖 " + "\n".join(lines))
+
+
 def watch_now():
     """你傳連結時順便在背景檢查收藏、書籤（不會卡住這則連結）。"""
     if watching():
@@ -2599,6 +2613,8 @@ def on_message(msg):
         return ask_retry_all(chat["id"])
     if cmd == "/watch":
         return show_watch(chat["id"])
+    if cmd == "/refresh":
+        return refresh(chat["id"])
     doc = msg.get("document")
     if doc and is_archive(doc.get("file_name")):  # 先看檔案：轉傳的說明裡常有別的連結
         return collect_archive(chat["id"], msg, doc)
@@ -2713,6 +2729,7 @@ def main():
             {"command": "cancel", "description": "取消下載或上傳（排隊中、進行中都可以）"},
             {"command": "retry", "description": "重試之前失敗的"},
             {"command": "watch", "description": "IG 收藏、X 書籤後自動下載"},
+            {"command": "refresh", "description": "馬上檢查 IG 收藏、X 書籤，新的下載"},
             {"command": "restart", "description": "重新啟動機器人"}])})
     except Exception as e:
         log.warning("設定指令選單失敗：%s", e)

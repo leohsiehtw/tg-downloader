@@ -145,13 +145,15 @@ _broken = set()  # 已經通知過抓不到的來源，恢復前不再重複通�
 
 def check_all(enabled, cookies, enqueue, warn):
     """你傳連結時在背景跑一輪。enabled：開著的來源代號；cookies：cookies 檔路徑；
-    enqueue(網址, 來源代號) 排進下載；warn(文字) 通知主人。"""
+    enqueue(網址, 來源代號) 排進下載；warn(文字) 通知主人。
+    回傳 ({來源代號: 新的幾則}, {來源代號: 錯誤})；已經有一輪在跑就回傳 None。"""
     if not enabled or not _busy.acquire(blocking=False):
-        return
+        return None
+    found, errors = {}, {}
     try:
         for src in enabled:
             try:
-                n = check(src, cookies, enqueue)
+                n = found[src] = check(src, cookies, enqueue)
                 if n:
                     log.info("%s：%d 則新的", SOURCES[src][0], n)
                 if src in _broken:
@@ -159,9 +161,11 @@ def check_all(enabled, cookies, enqueue, warn):
                     warn(f"✅ {SOURCES[src][0]} 又抓得到了。")
             except Exception as e:
                 log.warning("檢查 %s 失敗：%s", SOURCES[src][0], e)
+                errors[src] = e
                 if src not in _broken:
                     _broken.add(src)
                     warn(f"⚠️ 抓不到{SOURCES[src][0]}，可能是 cookies 過期或被網站擋了。"
                          f"恢復前不會再通知。\n{str(e)[:300]}")
     finally:
         _busy.release()
+    return found, errors
