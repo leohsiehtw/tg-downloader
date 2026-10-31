@@ -1253,6 +1253,9 @@ def handle(url, reply_chat, thread_id=0):
         notify_failed(reply_chat, f"❌ 失敗：{url}\n{str(e)[:500]}")
 
     try:
+        if saved_watch.profile(url):
+            shutil.rmtree(folder, ignore_errors=True)
+            return queue_profile(url, reply_chat, thread_id)
         files = download(url, folder)
     except Exception as e:
         failed(e)
@@ -1271,6 +1274,19 @@ def handle(url, reply_chat, thread_id=0):
         finally:
             shutil.rmtree(folder, ignore_errors=True)
     return send
+
+
+def queue_profile(url, reply_chat, thread_id):
+    """個人主頁連結：列出這個帳號全部的貼文，一則一則排進下載（舊的先），貼到同一個地方。"""
+    src, listing = saved_watch.profile(url)
+    status("📋 列出這個帳號的全部貼文，貼文多的話要等幾分鐘…")
+    items = saved_watch.posts(listing, src, cookie_file())
+    check_cancel()
+    if not items:
+        raise RuntimeError("這個帳號沒有抓到任何貼文（私人帳號要 cookies 那個帳號有追蹤）")
+    for _, post in reversed(items):
+        enqueue(post, reply_chat, thread_id)
+    notify(reply_chat, f"📋 {url}\n共 {len(items)} 則貼文都排進下載了，舊的先，會貼到{place(thread_id)}。")
 
 
 _uploader = None

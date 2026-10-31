@@ -12,6 +12,7 @@ import sys
 import tempfile
 import threading
 from pathlib import Path
+from urllib.parse import urlparse
 
 log = logging.getLogger("tg-downloader")
 
@@ -43,7 +44,30 @@ def save_seen(seen):
 
 def latest(src, cookies, peek=PEEK):
     """回傳最新 peek 則的 [(id, 貼文網址)]（None＝全部），最新的在前面。抓不到就丟 RuntimeError（訊息是 gallery-dl 的錯誤）。"""
-    url = SOURCES[src][1]
+    return posts(SOURCES[src][1], src, cookies, peek)
+
+
+# 網址第一段是這些的不是個人主頁
+IG_NOT_USER = {"p", "reel", "reels", "tv", "stories", "explore", "accounts", "direct", "s", "me", "about", "legal"}
+X_NOT_USER = {"i", "home", "search", "explore", "notifications", "messages", "settings", "hashtag", "intent",
+              "share", "compose", "login", "signup", "tos", "privacy", "jobs"}
+
+
+def profile(url):
+    """個人主頁連結 → (平台代號, 給 gallery-dl 列全部貼文的網址)；不是主頁回傳 None。
+    IG 用 /posts/（貼文和 reels），X 用 /media（只要有圖或影片的推文，不含轉推）。"""
+    u = urlparse(url)
+    host = (u.hostname or "").lower().removeprefix("www.").removeprefix("mobile.")
+    parts = [p for p in u.path.split("/") if p]
+    if host == "instagram.com" and parts and parts[0].lower() not in IG_NOT_USER             and (len(parts) == 1 or (len(parts) == 2 and parts[1] == "posts")):
+        return "ig", f"https://www.instagram.com/{parts[0]}/posts/"
+    if host in ("x.com", "twitter.com") and parts and parts[0].lower() not in X_NOT_USER             and (len(parts) == 1 or (len(parts) == 2 and parts[1] == "media")):
+        return "x", f"https://x.com/{parts[0]}/media"
+    return None
+
+
+def posts(url, src, cookies, peek=None):
+    """用 gallery-dl 列出網址裡的貼文 [(id, 貼文網址)]，最新的在前面；src 是 "ig" 或 "x"。"""
     tmp = Path(tempfile.mkdtemp(prefix="tgdl-saved-"))
     try:
         cmd = [sys.executable, "-m", "gallery_dl", "-j", url]
