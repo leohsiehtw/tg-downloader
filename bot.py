@@ -2354,23 +2354,37 @@ def show_watch(chat):
 
 def on_watch_button(data, chat, msg_id):
     kind, val = data.split("|", 1)
+    name = saved_watch.SOURCES.get(val, ("",))[0]
+    if kind == "s" and val not in watching():  # 要開啟：先問以前的收藏要不要下載
+        return tg("editMessageText", {
+            "chat_id": chat, "message_id": msg_id,
+            "text": f"開啟{name}。以前的收藏要不要也下載？\n全部下載可能有好幾百則，會排很久，也比較容易被網站暫時限制。",
+            "reply_markup": json.dumps({"inline_keyboard": [
+                [{"text": "只抓之後新收藏的", "callback_data": f"w|n|{val}"}],
+                [{"text": "以前的也全部下載", "callback_data": f"w|a|{val}"}],
+                [{"text": "取消", "callback_data": "w|c|"}]]})})
     if kind == "s":
         on = watching()
-        if val in on:
-            on.remove(val)
-            saved_watch.forget(val)
-        else:
-            on.append(val)
+        on.remove(val)
+        saved_watch.forget(val)
         save_env(WATCH_SAVED=",".join(on))
-        if val in on:  # 馬上記下現有的收藏，不用等下一輪
-            threading.Thread(target=watch_first, args=(val,), daemon=True).start()
+    elif kind in ("n", "a") and val not in watching():
+        save_env(WATCH_SAVED=",".join(watching() + [val]))
+        # 馬上記下現有的收藏（或全部排進下載），不用等你下次傳連結
+        threading.Thread(target=watch_first, args=(val, kind == "a"), daemon=True).start()
     tg("editMessageText", {"chat_id": chat, "message_id": msg_id, "text": watch_text(),
                            "reply_markup": watch_keyboard()})
 
 
-def watch_first(src):
+def watch_first(src, everything=False):
+    name = saved_watch.SOURCES[src][0]
     try:
-        saved_watch.check(src, cookie_file(), watch_enqueue)
+        if not everything:
+            return saved_watch.check(src, cookie_file(), watch_enqueue)
+        watch_warn(f"🔖 正在列出全部{name}，收藏多的話要等幾分鐘…")
+        n = saved_watch.backfill(src, cookie_file(), watch_enqueue)
+        watch_warn(f"🔖 {name}以前的 {n} 則都排進下載了，會貼到子頻道「{WATCH_TOPICS[src]}」。" if CHANNEL_ID
+                   else f"🔖 {name}以前的 {n} 則都排進下載了。")
     except Exception as e:
         watch_warn(f"⚠️ 抓不到{saved_watch.SOURCES[src][0]}，可能是 cookies 過期或沒放。\n{str(e)[:300]}")
 

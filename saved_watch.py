@@ -41,18 +41,20 @@ def save_seen(seen):
         log.warning("存 %s 失敗：%s", SEEN_FILE.name, e)
 
 
-def latest(src, cookies):
-    """回傳 [(id, 貼文網址)]，最新的在前面。抓不到就丟 RuntimeError（訊息是 gallery-dl 的錯誤）。"""
+def latest(src, cookies, peek=PEEK):
+    """回傳最新 peek 則的 [(id, 貼文網址)]（None＝全部），最新的在前面。抓不到就丟 RuntimeError（訊息是 gallery-dl 的錯誤）。"""
     url = SOURCES[src][1]
     tmp = Path(tempfile.mkdtemp(prefix="tgdl-saved-"))
     try:
-        cmd = [sys.executable, "-m", "gallery_dl", "-j", "--post-range", f"1-{PEEK}", url]
+        cmd = [sys.executable, "-m", "gallery_dl", "-j", url]
+        if peek:
+            cmd[3:3] = ["--post-range", f"1-{peek}"]
         if cookies:  # gallery-dl 結束時會改寫 cookies 檔，給它一份複本
             mine = tmp / "cookies.txt"
             shutil.copyfile(cookies, mine)
             cmd[3:3] = ["--cookies", str(mine)]
         r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                           timeout=300, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                           timeout=300 if peek else 3600, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     try:
@@ -91,6 +93,18 @@ def check(src, cookies, enqueue):
     for _, url in reversed(new):
         enqueue(url, src)
     return len(new)
+
+
+def backfill(src, cookies, enqueue):
+    """開啟時選了「以前的也下載」：抓全部收藏，全部排進下載（舊的先），之後只抓新的。回傳排了幾個。"""
+    items = latest(src, cookies, None)
+    with _lock:
+        seen = load_seen()
+        seen[src] = [i for i, _ in items][:KEEP]
+        save_seen(seen)
+    for _, url in reversed(items):
+        enqueue(url, src)
+    return len(items)
 
 
 def forget(src):
