@@ -2387,8 +2387,9 @@ def on_watch_button(data, chat, msg_id):
         save_env(WATCH_SAVED=",".join(watching() + [val]))
         # 馬上記下現有的收藏（或全部排進下載），不用等你下次傳連結
         threading.Thread(target=watch_first, args=(val, kind == "a"), daemon=True).start()
-    tg("editMessageText", {"chat_id": chat, "message_id": msg_id, "text": watch_text(),
-                           "reply_markup": watch_keyboard()})
+    with contextlib.suppress(RuntimeError):  # 連按兩下：內容沒變 Telegram 會報錯，不用管
+        tg("editMessageText", {"chat_id": chat, "message_id": msg_id, "text": watch_text(),
+                               "reply_markup": watch_keyboard()})
 
 
 def watch_first(src, everything=False):

@@ -125,19 +125,27 @@ class Uploader:
         if self.stop():
             raise Stopped("已取消")
         try:
-            self.progress(p.name, self.order.index(p) + 1, len(self.order), self.done + sent, self.total)
+            self.partial[p] = sent
+            self.progress(p.name, self.order.index(p) + 1, len(self.order),
+                          self.done + sum(self.partial.values()), self.total)
         except Exception:
             pass
 
+    async def _up(self, p: Path):
+        """上傳一個檔案。每塊用最大的 512KB（Telethon 預設 128KB），一塊一塊等回應，塊越大來回越少、越快。"""
+        file = await self._patient(lambda: self.client.upload_file(
+            str(p), part_size_kb=512, progress_callback=lambda s, _: self._tick(p, s)))
+        self.partial.pop(p, None)
+        self.done += p.stat().st_size
+        return file
+
     async def _media(self, p: Path, tmp):
-        """影片先自己上傳，附上長寬秒數和縮圖，才能跟照片一起放進同一則相簿。"""
+        """先自己上傳；影片再附上長寬秒數和縮圖，才能跟照片一起放進同一則相簿。"""
         if p.suffix.lower() not in VIDEO_EXT:
-            return str(p)
+            return await self._up(p)
         dur, w, h = _probe(p)
         t = _thumb(p, tmp)
-        file = await self._patient(lambda: self.client.upload_file(
-            str(p), progress_callback=lambda s, _: self._tick(p, s)))
-        self.done += p.stat().st_size
+        file = await self._up(p)
         return InputMediaUploadedDocument(
             file=file,
             mime_type=mimetypes.guess_type(p.name)[0] or "video/mp4",
@@ -152,6 +160,7 @@ class Uploader:
                  or (p.suffix.lower() in IMAGE_EXT and p.stat().st_size <= PHOTO_MAX_BYTES)]
         others = [p for p in paths if p not in album]
         self.order, self.done, self.total = album + others, 0, sum(p.stat().st_size for p in paths)
+        self.partial = {}  # 同時上傳中的檔案各傳了多少
         self.first_id = None  # 這次貼出去的第一則（bot.py 要釘選用）
         first = True
         sent = 0
@@ -159,20 +168,20 @@ class Uploader:
             # 照片和影片每 10 個合成一則相簿（全部傳完才一起貼出）；只有一個就單獨貼
             for i in range(0, len(album), 10):
                 group = album[i:i + 10]
-                batch = [await self._media(p, tmp) for p in group]
+                # 同一組的檔案同時上傳：一個一個傳的話大部分時間都在等 Telegram 回應
+                batch = await asyncio.gather(*(self._media(p, tmp) for p in group))
                 self._tick(group[-1])
                 r = await self._patient(lambda: self.client.send_file(
                     entity, batch if len(batch) > 1 else batch[0], caption=(caption or None) if first else None,
                     reply_to=reply_to, supports_streaming=True))
-                self.done += sum(p.stat().st_size for p in group if p.suffix.lower() not in VIDEO_EXT)
                 sent += len(r) if isinstance(r, list) else 1
                 self.first_id = self.first_id or (r[0] if isinstance(r, list) else r).id
                 first = False
         for p in others:  # gif、太大的圖片和其他檔案逐一送
+            file = await self._up(p)
             r = await self._patient(lambda p=p: self.client.send_file(
-                entity, str(p), caption=(caption or None) if first else None, reply_to=reply_to,
-                force_document=p.suffix.lower() in IMAGE_EXT, progress_callback=lambda s, _: self._tick(p, s)))
-            self.done += p.stat().st_size
+                entity, file, caption=(caption or None) if first else None, reply_to=reply_to,
+                force_document=p.suffix.lower() in IMAGE_EXT))
             sent += 1
             self.first_id = self.first_id or r.id
             first = False
