@@ -6,6 +6,7 @@
 """
 import json
 import logging
+import re
 import shutil
 import subprocess
 import sys
@@ -53,9 +54,12 @@ X_NOT_USER = {"i", "home", "search", "explore", "notifications", "messages", "se
               "share", "compose", "login", "signup", "tos", "privacy", "jobs"}
 
 
+PH_USER = {"pornstar", "model", "channels", "users"}  # Pornhub 這幾種網址是主頁
+
+
 def profile(url):
-    """個人主頁連結 → (平台代號, 給 gallery-dl 列全部貼文的網址)；不是主頁回傳 None。
-    IG 用 /posts/（貼文和 reels），X 用 /media（只要有圖或影片的推文，不含轉推）。"""
+    """個人主頁連結 → (平台代號, 列全部貼文的網址)；不是主頁回傳 None。
+    IG 用 /posts/（貼文和 reels），X 用 /media（只要有圖或影片的推文，不含轉推），PH 用 /videos（上傳的影片）。"""
     u = urlparse(url)
     host = (u.hostname or "").lower().removeprefix("www.").removeprefix("mobile.")
     parts = [p for p in u.path.split("/") if p]
@@ -63,18 +67,23 @@ def profile(url):
         return "ig", f"https://www.instagram.com/{parts[0]}/posts/"
     if host in ("x.com", "twitter.com") and parts and parts[0].lower() not in X_NOT_USER             and (len(parts) == 1 or (len(parts) == 2 and parts[1] == "media")):
         return "x", f"https://x.com/{parts[0]}/media"
+    if host.endswith(("pornhub.com", "pornhub.org")) and len(parts) >= 2 and parts[0].lower() in PH_USER:
+        return "ph", f"https://www.pornhub.com/{parts[0].lower()}/{parts[1]}/videos"
     return None
 
 
 def posts(url, src, cookies, peek=None, procs=None):
-    """用 gallery-dl 列出網址裡的貼文 [(id, 貼文網址)]，最新的在前面；src 是 "ig" 或 "x"。
+    """用 gallery-dl 列出網址裡的貼文 [(id, 貼文網址)]，最新的在前面；src 是 "ig"、"x" 或 "ph"（PH 用 yt-dlp）。
     procs：有給的話列清單時把 gallery-dl 放進去，按取消時 bot.py 才砍得掉。"""
     tmp = Path(tempfile.mkdtemp(prefix="tgdl-saved-"))
     try:
-        cmd = [sys.executable, "-m", "gallery_dl", "-j", url]
+        if src == "ph":
+            cmd = [sys.executable, "-m", "yt_dlp", "--flat-playlist", "--print", "url", url]
+        else:
+            cmd = [sys.executable, "-m", "gallery_dl", "-j", url]
         if peek:
-            cmd[3:3] = ["--post-range", f"1-{peek}"]
-        if cookies:  # gallery-dl 結束時會改寫 cookies 檔，給它一份複本
+            cmd[3:3] = ["--playlist-end", str(peek)] if src == "ph" else ["--post-range", f"1-{peek}"]
+        if cookies:  # gallery-dl、yt-dlp 結束時會改寫 cookies 檔，給它一份複本
             mine = tmp / "cookies.txt"
             shutil.copyfile(cookies, mine)
             cmd[3:3] = ["--cookies", str(mine)]
@@ -94,6 +103,11 @@ def posts(url, src, cookies, peek=None, procs=None):
         r = subprocess.CompletedProcess(cmd, p.returncode, out, err)
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+    if src == "ph":
+        keys = re.findall(r"viewkey=(\w+)", r.stdout)
+        if r.returncode and not keys:
+            raise RuntimeError((r.stderr or r.stdout).strip()[-300:] or f"yt-dlp 結束代碼 {r.returncode}")
+        return [(k, f"https://www.pornhub.com/view_video.php?viewkey={k}") for k in dict.fromkeys(keys)]
     try:
         messages = json.loads(r.stdout)
     except ValueError:

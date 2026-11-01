@@ -1146,7 +1146,10 @@ def download(url, folder: Path):
     """先用 gallery-dl（圖片 / 多圖貼文較強），沒抓到再用 yt-dlp（影片）。"""
     errors = []
     status("⬇️ 下載中…")
-    for name, fn in (("gallery-dl", run_gallerydl), ("yt-dlp", run_ytdlp)):
+    tools = (("gallery-dl", run_gallerydl), ("yt-dlp", run_ytdlp))
+    if "pornhub." in (urlparse(url).hostname or ""):  # PH 影片 gallery-dl 抓不到，直接用 yt-dlp
+        tools = tools[1:]
+    for name, fn in tools:
         try:
             r = fn(url, folder)
         except Cancelled:
@@ -2346,7 +2349,7 @@ def watch_now():
                          args=(watching(), cookie_file(), watch_enqueue, watch_warn)).start()
 
 
-WATCH_TOPICS = {"ig": "IG", "x": "X"}  # 各來源貼到哪個子頻道，沒有就自動建
+WATCH_TOPICS = {"ig": "IG", "x": "X", "ph": "PH"}  # 各來源貼到哪個子頻道，沒有就自動建
 _topic_lock = threading.Lock()
 
 
@@ -2389,7 +2392,7 @@ def watch_enqueue(url, src):
             return enqueue(url, None, default_topic())
         notify(owner, f"❌ 建子頻道「{WATCH_TOPICS[src]}」失敗：{str(e)[:200]}\n"
                       "我要是群組管理員、有「管理話題」權限，群組也要開「話題」。這則先問你要貼到哪。")
-        return ask_topic(owner, url, f"🔖 {saved_watch.SOURCES[src][0]}：{url}")
+        return ask_topic(owner, url, f"🔖 {saved_watch.SOURCES.get(src, (WATCH_TOPICS[src],))[0]}：{url}")
     enqueue(url, owner, tid)
 
 
@@ -2405,7 +2408,7 @@ def watch_text():
     for k, (name, _) in saved_watch.SOURCES.items():
         lines.append(f"{name}：{'開' if k in on else '關'}")
     if CHANNEL_ID:
-        lines.append("貼到：" + "、".join(f"{saved_watch.SOURCES[k][0]} → 子頻道「{n}」" for k, n in WATCH_TOPICS.items())
+        lines.append("貼到：" + "、".join(f"{saved_watch.SOURCES[k][0]} → 子頻道「{WATCH_TOPICS[k]}」" for k in saved_watch.SOURCES)
                      + "（沒有會自動建）")
     lines.append("剛開啟時現有的收藏不會下載，之後新收藏的才會。")
     return "\n".join(lines)

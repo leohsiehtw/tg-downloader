@@ -3,6 +3,7 @@
 ## [Unreleased]
 
 ### 新增
+- 支援 Pornhub：傳影片連結直接下載；傳 pornstar / model / channels / users 主頁會下載全部影片，自動貼到子頻道「PH」，同一個主頁再發只抓新的。需要 `curl_cffi`（已加進 requirements.txt）。
 - 傳一個連結時，「要貼到哪個子頻道？」和「收到連結」的訊息會附上那則貼文的小縮圖預覽（網站有提供才有）。
 
 ### 修正

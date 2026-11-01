@@ -1,5 +1,6 @@
 requests>=2.31
 yt-dlp
+curl_cffi
 gallery-dl
 telethon
 cryptg
