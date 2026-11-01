@@ -2356,8 +2356,8 @@ _topic_lock = threading.Lock()
 def topic_alive(tid, name):
     """子頻道還在嗎？貼到被刪掉的子頻道 Telegram 不會報錯，會跑到 General。
     用同樣的名稱改名試探：還在會回「沒改到」，被刪了回 TOPIC_ID_INVALID。"""
-    try:
-        tg("editForumTopic", {"chat_id": CHANNEL_ID, "message_thread_id": tid, "name": name})
+    try:  # 不帶 name：帶舊名會把你改過的名稱改回去
+        tg("editForumTopic", {"chat_id": CHANNEL_ID, "message_thread_id": tid})
     except RuntimeError as e:
         return "TOPIC_ID_INVALID" not in str(e)
     except Exception:
@@ -2371,14 +2371,22 @@ def watch_topic(src):
         return 0
     name = WATCH_TOPICS[src]
     with _topic_lock:  # IG、X 同時有新的時不要建兩個
-        if name in TOPICS and not topic_alive(TOPICS[name], name):
+        # 用 id 認子頻道，你改名後還是同一個；舊設定沒有記 id 的，照名稱認一次
+        wid = _parse_topics(os.environ.get("WATCH_IDS", ""))
+        tid = wid.get(src) or TOPICS.get(name)
+        if tid and tid not in TOPICS.values():
+            tid = None  # 被 /setup 之類移除了
+        if tid and not topic_alive(tid, name):
             log.info("子頻道 %s 被刪掉了，重建", name)
-            save_env(TOPICS=",".join(f"{n}:{i}" for n, i in TOPICS.items() if n != name))
-        if name not in TOPICS:
+            save_env(TOPICS=",".join(f"{n}:{i}" for n, i in TOPICS.items() if i != tid))
+            tid = None
+        if not tid:
             tid = tg("createForumTopic", {"chat_id": CHANNEL_ID, "name": name})["message_thread_id"]
             save_env(TOPICS=",".join(f"{n}:{i}" for n, i in {**TOPICS, name: tid}.items()))
             log.info("建好子頻道 %s", name)
-        return TOPICS[name]
+        if wid.get(src) != tid:
+            save_env(WATCH_IDS=",".join(f"{k}:{v}" for k, v in {**wid, src: tid}.items()))
+        return tid
 
 
 def watch_enqueue(url, src):
@@ -2589,9 +2597,22 @@ def answer(cb, text=None):
         pass
 
 
+def on_topic_renamed(msg):
+    """群組裡子頻道被改名：TOPICS 的名稱跟著改，id 不變（按鈕、自動子頻道照舊用同一個）。"""
+    new = re.sub(r"[,:]", "", (msg["forum_topic_edited"].get("name") or "")).strip()
+    tid = msg.get("message_thread_id")
+    old = next((n for n, i in TOPICS.items() if i == tid), None)
+    if not new or old is None or old == new:
+        return
+    save_env(TOPICS=",".join(f"{new if i == tid else n}:{i}" for n, i in TOPICS.items()))
+    log.info("子頻道 %s 改名為 %s", old, new)
+
+
 def on_message(msg):
     uid = (msg.get("from") or {}).get("id")
     chat = msg.get("chat", {})
+    if msg.get("forum_topic_edited") and CHANNEL_ID and str(chat.get("id")) == CHANNEL_ID:
+        return on_topic_renamed(msg)
     text = (msg.get("text") or "") + " " + (msg.get("caption") or "")
     private = chat.get("type") == "private"
     if not ALLOWED_USER_IDS and private and text.startswith("/start"):
