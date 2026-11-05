@@ -1399,7 +1399,7 @@ def send_folder(sendable, paths, names, tmp, failed, reply_chat, thread_id):
 
 # ---------------- 壓縮檔（轉傳給機器人的 zip / 7z / rar） ----------------
 
-ARCHIVE_RE = re.compile(r"\.(zip|7z|rar|z\d\d|r\d\d|\d{3})$", re.I)
+ARCHIVE_RE = re.compile(r"\.(zip|7z|rar|tar|z\d\d|r\d\d|\d{3})$", re.I)
 PARTS_WAIT = 2  # 收到分卷後等幾秒，同一組的其他分卷一起轉傳時會陸續進來（單一壓縮檔不用等）
 VOLUME_RE = re.compile(r"\.(part\d+\.rar|z\d\d|r\d\d|\d{3})$", re.I)  # 檔名看得出是分卷
 PASSWORD_WAIT = 24 * 3600  # 等你給密碼最多等多久，過了就把下載的檔案刪掉
@@ -1447,7 +1447,7 @@ def safe_name(name):
 
 def archive_key(name):
     """同一組分卷的共同名字：a.7z.001 / a.part2.rar / a.z01 → a.7z / a.rar / a.zip。"""
-    for pat, ext in ((r"(.+)\.part\d+\.rar$", ".rar"), (r"(.+\.(?:7z|zip|rar))\.\d{3}$", ""),
+    for pat, ext in ((r"(.+)\.part\d+\.rar$", ".rar"), (r"(.+\.(?:7z|zip|rar|tar))\.\d{3}$", ""),
                      (r"(.+)\.(?:z\d\d|zip)$", ".zip"), (r"(.+)\.(?:r\d\d|rar)$", ".rar"), (r"(.+)\.\d{3}$", "")):
         m = re.match(pat, name, re.I)
         if m:
@@ -1464,7 +1464,7 @@ def first_volume(paths):
     """要交給 7-Zip 的那個檔：.001、.part1.rar，或沒有編號的 .zip / .rar / .7z（其他分卷它會自己找）。"""
     names = sorted(paths, key=natural)
     for test in (lambda n: n.endswith(".001"), lambda n: re.search(r"\.part0*1\.rar$", n),
-                 lambda n: n.endswith((".zip", ".rar", ".7z"))):
+                 lambda n: n.endswith((".zip", ".rar", ".7z", ".tar"))):
         hit = next((p for p in names if test(p.name.lower())), None)
         if hit:
             return hit
@@ -1609,7 +1609,7 @@ def handle_archive(job, reply_chat, thread_id=0):
     except Exception as e:
         failed(e)
         return None
-    caption = Path(job.name).stem if job.name.lower().endswith((".zip", ".7z", ".rar")) else job.name
+    caption = Path(job.name).stem if job.name.lower().endswith((".zip", ".7z", ".rar", ".tar")) else job.name
 
     def send():
         try:
