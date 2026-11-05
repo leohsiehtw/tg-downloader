@@ -1412,6 +1412,9 @@ waiting = {}  # 等你給密碼的壓縮檔
 BOT_USERNAME = ""
 
 
+INNER_ARCHIVE_EXT = {".zip", ".7z", ".rar", ".tar", ".001"}
+
+
 class NeedPassword(Exception):
     pass
 
@@ -1552,7 +1555,8 @@ def extract(job, out: Path):
     """用 7-Zip 只解出圖片和影片。沒密碼先直接解，要密碼就依序試猜的；都不對丟 NeedPassword。"""
     exe = seven_zip()
     first = first_volume([job.folder / p["name"] for p in job.parts])
-    only = [f"-ir!*{ext}" for ext in sorted(IMAGE_EXT | VIDEO_EXT | GIF_EXT)]
+    media = [f"-ir!*{ext}" for ext in sorted(IMAGE_EXT | VIDEO_EXT | GIF_EXT)]
+    only = media + [f"-ir!*{ext}" for ext in sorted(INNER_ARCHIVE_EXT)]  # 順便解出內層壓縮檔
     tries = [job.password] if job.password is not None else ["", *guess_passwords(job)]
     for n, pw in enumerate(tries, 1):
         shutil.rmtree(out, ignore_errors=True)
@@ -1564,12 +1568,34 @@ def extract(job, out: Path):
             continue
         if r.returncode not in (0, 1):  # 1＝有警告但有解出來
             raise RuntimeError(f"解壓失敗（分卷不齊或檔案壞掉？）\n{r.stdout[-400:]}")
+        inner = sorted((p for p in out.rglob("*") if p.is_file() and p.suffix.lower() in INNER_ARCHIVE_EXT
+                        and "__MACOSX" not in p.parts and not p.name.startswith("._")), key=natural)
+        bad = False
+        for i, a in enumerate(inner, 1):  # 只解一層，密碼沿用外層這組
+            r = run_tool([exe, "x", "-y", "-bso0", "-bsp0", "-sccUTF-8", f"-p{pw}", f"-o{out / f'內層{i}'}",
+                          str(a), *media], timeout=7200)
+            if "wrong password" in r.stdout.lower():
+                bad = True
+                break
+        if bad:
+            continue
         if pw:
             remember_password(pw)
             log.info("%s 的密碼是 %s", job.name, pw)
         return pw
     shutil.rmtree(out, ignore_errors=True)
     raise NeedPassword()
+
+
+def list_archive(job, limit=30):
+    """用 7z l 列出壓縮檔裡的前幾個檔名（除錯用，失敗就回空清單）。"""
+    try:
+        first = first_volume([job.folder / p["name"] for p in job.parts])
+        r = run_tool([seven_zip(), "l", "-slt", "-sccUTF-8", f"-p{job.password or ''}", str(first)], timeout=300)
+        paths = [ln[7:] for ln in r.stdout.splitlines() if ln.startswith("Path = ")]
+        return paths[1:limit + 1]  # 第一個是壓縮檔本身
+    except Exception:
+        return []
 
 
 def archive_media(out: Path):
@@ -1597,7 +1623,10 @@ def handle_archive(job, reply_chat, thread_id=0):
         pw = extract(job, out)
         files = archive_media(out)
         if not files:
-            notify(reply_chat, f"⚠️ {job.name} 裡沒有圖片或影片，什麼都沒貼。")
+            names = list_archive(job)
+            log.warning("%s 裡沒有圖片或影片，內容（前 30 個）：%s", job.name, names)
+            shown = "\n" + "\n".join(names[:10]) if names else ""
+            notify(reply_chat, f"⚠️ {job.name} 裡沒有圖片或影片，什麼都沒貼。{shown}")
             shutil.rmtree(job.folder, ignore_errors=True)
             return None
         files = [make_playable(p) for p in files]
